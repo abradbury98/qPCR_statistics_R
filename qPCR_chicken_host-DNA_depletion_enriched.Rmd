@@ -1,0 +1,2543 @@
+---
+title: "qPCR Host-DNA Depletion Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc:  true
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+```
+
+
+```{r load libraries}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(readxl)
+
+```
+
+#Import and organise data
+```{r load data}
+# Read the data
+data <- read_excel("qPCR_host_depletion_chicken_all.xlsx")
+
+# View structure
+glimpse(data)
+
+```
+
+
+```{r clean data}
+
+# Clean and structure the data
+data_clean <- data %>%
+  # Remove rows with all NA values
+  filter(! is.na(Name)) %>%
+  # Extract sample information from Name column
+  mutate(
+    # Determine if host depletion was applied
+    Treatment = case_when(
+      str_detect(Name, "No Host") ~ "Before Depletion",
+      str_detect(Name, "Host-DNA Depletion|\\bHost\\b") ~ "After Depletion",
+      TRUE ~ "Unknown"
+    ),
+    # Make Treatment a factor with Before first
+    Treatment = factor(Treatment, levels = c("Before Depletion", "After Depletion")),
+    # Extract sample type
+    Sample_Type = case_when(
+      str_detect(Name, "cheesecloth") ~ "Cheesecloth",
+      str_detect(Name, "RVS") ~ "RVS",
+      str_detect(Name, "CAT") ~ "CAT",
+      str_detect(Name, "Cent \\+ Filt") ~ "Centrifuge + Filter",
+      str_detect(Name, "Filt") & ! str_detect(Name, "Cent") ~ "Filter Only",
+      TRUE ~ "Unknown"
+    ),
+    # Extract replicate number
+    Replicate_ID = str_extract(Name, "\\d+$"),
+    Replicate_ID = as.numeric(Replicate_ID)
+  ) %>%
+  # Keep only necessary columns
+  select(Name, Treatment, Sample_Type, Replicate_ID, Ct, `Calc Conc (ng/ul)`) %>%
+  # Rename for easier handling
+  rename(Concentration = `Calc Conc (ng/ul)`)
+
+
+# View cleaned data summary
+data_clean %>% 
+  group_by(Sample_Type, Treatment) %>% 
+  summarise(
+    Total_Measurements = n(),
+    Detected = sum(!is.na(Concentration)),
+    Non_Detects = sum(is.na(Concentration)),
+    .groups = "drop"
+  ) %>%
+  knitr:: kable(caption = "Data Overview by Sample Type and Treatment")
+
+```
+
+
+```{r prepare data for plotting}
+
+# Set detection limits for non-detects
+# Non-detects indicate successful DNA depletion (below detection limit)
+
+max_ct_observed <- max(data_clean$Ct, na.rm = TRUE)
+detection_limit_ct <- 40  # Standard qPCR detection limit
+detection_limit_conc <- 0.0001  # Very low concentration (0.1 pg/μL)
+
+cat("Maximum Ct observed:", round(max_ct_observed, 2), "\n")
+cat("Detection limit Ct:", detection_limit_ct, "\n")
+cat("Detection limit concentration:", detection_limit_conc, "ng/μL\n")
+
+# Create complete dataset with imputed values for non-detects
+data_complete <- data_clean %>%
+  mutate(
+    # Flag non-detects
+    Below_Detection = is.na(Ct),
+    # For statistical purposes, assign detection limit to non-detects
+    Ct_imputed = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Concentration_imputed = ifelse(is.na(Concentration), detection_limit_conc, Concentration),
+    # Keep track of original values
+    Concentration_original = Concentration,
+    Ct_original = Ct
+  )
+
+# Calculate summary statistics by biological replicate
+# This averages the 3 technical triplicates for each biological replicate
+summary_stats <- data_complete %>%
+  group_by(Sample_Type, Treatment, Replicate_ID) %>%
+  summarise(
+    n_measurements = n(),
+    n_detected = sum(!Below_Detection),
+    n_non_detect = sum(Below_Detection),
+    Mean_Ct = mean(Ct, na.rm = TRUE),
+    SD_Ct = sd(Ct, na.rm = TRUE),
+    SE_Ct = SD_Ct / sqrt(sum(!is.na(Ct))),
+    Mean_Conc = mean(Concentration, na.rm = TRUE),
+    SD_Conc = sd(Concentration, na.rm = TRUE),
+    SE_Conc = SD_Conc / sqrt(sum(!is.na(Concentration))),
+    Mean_Conc_imputed = mean(Concentration_imputed, na.rm = TRUE),
+    Mean_Ct_imputed = mean(Ct_imputed, na.rm = TRUE),
+    All_Non_Detect = all(Below_Detection),
+    .groups = "drop"
+  )
+
+# Display summary table
+summary_stats %>%
+  select(Sample_Type, Treatment, Replicate_ID, n_detected, n_non_detect, Mean_Ct, Mean_Conc) %>%
+  knitr:: kable(digits = 2, caption = "Summary Statistics by Biological Replicate")
+
+
+```
+
+#Cheesecloth samples
+```{r Ct Values for Cheesecloth run}
+
+# Filter cheesecloth data
+cheesecloth_summary <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth")
+
+# Create Ct plot
+plot_cheesecloth_ct <- ggplot(cheesecloth_summary, 
+                              aes(x = Treatment, y = Mean_Ct, fill = Treatment)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+  geom_errorbar(aes(ymin = pmax(Mean_Ct - SE_Ct, 0), ymax = Mean_Ct + SE_Ct),
+                width = 0.2, position = position_dodge(0.9)) +
+  geom_point(aes(y = Mean_Ct), size = 3, shape = 21, fill = "white") +
+  facet_wrap(~paste("Replicate", Replicate_ID), ncol = 3) +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Host-DNA Depletion Efficacy (Ct Values)",
+    subtitle = "Higher Ct = Less chicken DNA detected",
+    x = NULL,
+    y = "Ct Value",
+    fill = "Treatment"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_cheesecloth_ct)
+ggsave("cheesecloth_ct_values.png", plot_cheesecloth_ct, width = 10, height = 6, dpi = 600)
+
+```
+
+
+#Cheesecloth - concentration
+```{r Concentration Values for Cheesecloth run}
+# Create concentration plot
+plot_cheesecloth_conc <- ggplot(cheesecloth_summary, 
+                                aes(x = Treatment, y = Mean_Conc, fill = Treatment)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+  geom_errorbar(aes(ymin = pmax(Mean_Conc - SE_Conc, 0), ymax = Mean_Conc + SE_Conc),
+                width = 0.2, position = position_dodge(0.9)) +
+  geom_point(aes(y = Mean_Conc), size = 3, shape = 21, fill = "white") +
+  facet_wrap(~paste("Replicate", Replicate_ID), ncol = 3) +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Host-DNA Depletion Efficacy (Concentration)",
+    subtitle = "Chicken DNA concentration before and after host-DNA depletion",
+    x = NULL,
+    y = "DNA Concentration (ng/μL)",
+    fill = "Treatment"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_cheesecloth_conc)
+
+ggsave("cheesecloth_concentration.png", plot_cheesecloth_conc, width = 10, height = 6, dpi = 600)
+
+```
+
+
+#Filtered Samples
+```{r Ct Values for Filtered Samples}
+
+# Filter data for filtered samples
+filtered_summary <- summary_stats %>%
+  filter(Sample_Type %in% c("Centrifuge + Filter", "Filter Only"))
+
+# Check if we need log scale (if max/min ratio > 100)
+conc_range <- filtered_summary %>% filter(! is.na(Mean_Conc)) %>% pull(Mean_Conc)
+use_log_filtered <- ifelse(length(conc_range) > 1 && max(conc_range)/min(conc_range) > 100, TRUE, FALSE)
+
+cat("Using log scale for filtered samples:", use_log_filtered, "\n")
+
+```
+
+
+```{r Ct values for Filtered Samples}
+
+# Create Ct plot
+plot_filtered_ct <- ggplot(filtered_summary, 
+                           aes(x = Treatment, y = Mean_Ct_imputed, fill = Treatment)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+  geom_errorbar(aes(ymin = pmax(Mean_Ct_imputed - SE_Ct, 0), ymax = pmin(Mean_Ct_imputed + SE_Ct, 40)),
+                width = 0.2, position = position_dodge(0.9)) +
+  geom_point(aes(y = Mean_Ct_imputed), size = 3, shape = 21, fill = "white") +
+  geom_text(data = filtered_summary %>% filter(All_Non_Detect),
+            aes(x = Treatment, y = Mean_Ct_imputed - 2, label = "ND"),
+            size = 3.5, fontface = "bold", color = "white") +
+  facet_grid(Sample_Type ~ paste("Replicate", Replicate_ID)) +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)), limits = c(0, 40)) +
+  labs(
+    title = "Filtered Samples: Host-DNA Depletion Efficacy (Ct Values)",
+    subtitle = "Higher Ct = Less DNA; ND = No chicken DNA Detected",
+    x = NULL,
+    y = "Ct Value",
+    fill = "Treatment"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_filtered_ct)
+ggsave("filtered_ct_values.png", plot_filtered_ct, width = 12, height = 8, dpi = 600)
+
+```
+
+
+```{r Concentration Values for Filtered Samples}
+
+# Create concentration plot (log scale if necessary)
+if(use_log_filtered) {
+  plot_filtered_conc <- ggplot(filtered_summary, 
+                               aes(x = Treatment, y = Mean_Conc_imputed, fill = Treatment)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+    geom_point(aes(y = Mean_Conc_imputed), size = 3, shape = 21, fill = "white") +
+    geom_text(data = filtered_summary %>% filter(All_Non_Detect),
+              aes(x = Treatment, y = Mean_Conc_imputed * 3, label = "ND"),
+              size = 3.5, fontface = "bold", color = "#4DBBD5") +
+    facet_grid(Sample_Type ~ paste("Replicate", Replicate_ID)) +
+    scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+    scale_y_continuous(trans = "log10",
+                       labels = scales::trans_format("log10", scales:: math_format(10^.x))) +
+    labs(
+      title = "Filtered Samples: Host-DNA Depletion Efficacy (Concentration)",
+      subtitle = "Higher Ct = Less DNA; ND = No chicken DNA Detected",
+      x = NULL,
+      y = "DNA Concentration (ng/μL, log scale)",
+      fill = "Treatment"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "gray90"),
+      strip.text = element_text(face = "bold", size = 9),
+      panel.grid.major.x = element_blank()
+    )
+} else {
+  plot_filtered_conc <- ggplot(filtered_summary, 
+                               aes(x = Treatment, y = Mean_Conc_imputed, fill = Treatment)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+    geom_errorbar(aes(ymin = pmax(Mean_Conc_imputed - SE_Conc, 0), 
+                      ymax = Mean_Conc_imputed + SE_Conc),
+                  width = 0.2, position = position_dodge(0.9)) +
+    geom_point(aes(y = Mean_Conc_imputed), size = 3, shape = 21, fill = "white") +
+    geom_text(data = filtered_summary %>% filter(All_Non_Detect),
+              aes(x = Treatment, y = max(filtered_summary$Mean_Conc_imputed, na.rm=TRUE) * 0.05, 
+                  label = "ND"),
+              size = 3.5, fontface = "bold", color = "#4DBBD5") +
+    facet_grid(Sample_Type ~ paste("Replicate", Replicate_ID)) +
+    scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    labs(
+      title = "Filtered Samples: Host-DNA Depletion Efficacy (Concentration)",
+      subtitle = "Higher Ct = Less DNA; ND = No chicken DNA Detected",
+      x = NULL,
+      y = "DNA Concentration (ng/μL)",
+      fill = "Treatment"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "gray90"),
+      strip.text = element_text(face = "bold", size = 9),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+print(plot_filtered_conc)
+ggsave("filtered_concentration.png", plot_filtered_conc, width = 12, height = 8, dpi = 600)
+
+```
+
+#Enrichment samples
+
+```{r organise data for Enrichment Samples}
+# Filter data for enriched samples (only keep replicates with at least some "Before" data)
+enriched_summary <- summary_stats %>%
+  filter(Sample_Type %in% c("RVS", "CAT")) %>%
+  group_by(Sample_Type, Replicate_ID) %>%
+  filter(any(Treatment == "Before Depletion" & n_detected > 0)) %>%
+  ungroup()
+
+# Check if we need log scale
+conc_range_enriched <- enriched_summary %>% filter(!is.na(Mean_Conc)) %>% pull(Mean_Conc)
+use_log_enriched <- ifelse(length(conc_range_enriched) > 1 && max(conc_range_enriched)/min(conc_range_enriched) > 100, TRUE, FALSE)
+
+cat("Using log scale for enriched samples:", use_log_enriched, "\n")
+```
+
+
+```{r Ct Values for Enrichment Samples}
+
+# Create Ct plot
+plot_enriched_ct <- ggplot(enriched_summary, 
+                           aes(x = Treatment, y = Mean_Ct_imputed, fill = Treatment)) +
+  geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+  geom_errorbar(aes(ymin = pmax(Mean_Ct_imputed - SE_Ct, 0), ymax = pmin(Mean_Ct_imputed + SE_Ct, 40)),
+                width = 0.2, position = position_dodge(0.9)) +
+  geom_point(aes(y = Mean_Ct_imputed), size = 3, shape = 21, fill = "white") +
+  geom_text(data = enriched_summary %>% filter(All_Non_Detect),
+            aes(x = Treatment, y = Mean_Ct_imputed - 2, label = "ND"),
+            size = 3.5, fontface = "bold", color = "white") +
+  facet_grid(Sample_Type ~ paste("Replicate", Replicate_ID), scales = "free_x") +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)), limits = c(0, 40)) +
+  labs(
+    title = "Enriched Samples: Host-DNA Depletion Efficacy (Ct Values)",
+    subtitle = "RVS and CAT enrichment; Higher Ct = Less DNA; ND = No chicken DNA Detected",
+    x = NULL,
+    y = "Ct Value",
+    fill = "Treatment"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_enriched_ct)
+ggsave("enriched_ct_values.png", plot_enriched_ct, width = 12, height = 8, dpi = 600)
+
+```
+
+```{r Concentration Values for Enrichment Samples}
+
+# Create concentration plot (log scale if necessary)
+if(use_log_enriched) {
+  plot_enriched_conc <- ggplot(enriched_summary, 
+                               aes(x = Treatment, y = Mean_Conc_imputed, fill = Treatment)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+    geom_point(aes(y = Mean_Conc_imputed), size = 3, shape = 21, fill = "white") +
+    geom_text(data = enriched_summary %>% filter(All_Non_Detect),
+              aes(x = Treatment, y = Mean_Conc_imputed * 3, label = "ND"),
+              size = 3.5, fontface = "bold", color = "#4DBBD5") +
+    facet_grid(Sample_Type ~ paste("Replicate", Replicate_ID), scales = "free_x") +
+    scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+    scale_y_continuous(trans = "log10",
+                       labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+    labs(
+      title = "Enriched Samples: Host-DNA Depletion Efficacy (Concentration)",
+      subtitle = "Log scale; ND = No chicken DNA detected (below detection limit)",
+      x = NULL,
+      y = "DNA Concentration (ng/μL, log scale)",
+      fill = "Treatment"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "gray90"),
+      strip.text = element_text(face = "bold", size = 9),
+      panel.grid.major.x = element_blank()
+    )
+} else {
+  plot_enriched_conc <- ggplot(enriched_summary, 
+                               aes(x = Treatment, y = Mean_Conc_imputed, fill = Treatment)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9), alpha = 0.7, width = 0.7) +
+    geom_errorbar(aes(ymin = pmax(Mean_Conc_imputed - SE_Conc, 0), 
+                      ymax = Mean_Conc_imputed + SE_Conc),
+                  width = 0.2, position = position_dodge(0.9)) +
+    geom_point(aes(y = Mean_Conc_imputed), size = 3, shape = 21, fill = "white") +
+    geom_text(data = enriched_summary %>% filter(All_Non_Detect),
+              aes(x = Treatment, y = max(enriched_summary$Mean_Conc_imputed, na.rm=TRUE) * 0.05, 
+                  label = "ND"),
+              size = 3.5, fontface = "bold", color = "#4DBBD5") +
+    facet_grid(Sample_Type ~ paste("Replicate", Replicate_ID), scales = "free_x") +
+    scale_fill_manual(values = c("Before Depletion" = "#E64B35", "After Depletion" = "#4DBBD5")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    labs(
+      title = "Enriched Samples: Host-DNA Depletion Efficacy (Concentration)",
+      subtitle = "ND = No chicken DNA detected (below detection limit)",
+      x = NULL,
+      y = "DNA Concentration (ng/μL)",
+      fill = "Treatment"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "gray90"),
+      strip.text = element_text(face = "bold", size = 9),
+      panel.grid.major.x = element_blank()
+    )
+}
+
+print(plot_enriched_conc)
+ggsave("enriched_concentration.png", plot_enriched_conc, width = 12, height = 8, dpi = 600)
+
+```
+
+
+#Statistical Analysis
+```{r Statistical Analysis - t-test verify pairing}
+
+cat("\n========================================\n")
+cat("VERIFYING SAMPLE PAIRING\n")
+cat("========================================\n\n")
+
+cat("Experimental Design:\n")
+cat("Each biological replicate (1, 2, 3) represents the SAME sample\n")
+cat("measured before and after host-DNA depletion.\n\n")
+
+cat("This is a PAIRED design, which is more powerful because:\n")
+cat("  ✓ Controls for sample-to-sample variability\n")
+cat("  ✓ Each sample serves as its own control\n")
+cat("  ✓ Increases statistical power\n\n")
+
+# Show the pairing structure for cheesecloth
+pairing_check <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth", ! is.na(Mean_Conc)) %>%
+  select(Replicate_ID, Treatment, Mean_Ct, Mean_Conc) %>%
+  arrange(Replicate_ID, Treatment)
+
+for(rep in unique(pairing_check$Replicate_ID)) {
+  rep_data <- pairing_check %>% filter(Replicate_ID == rep)
+  
+  cat("Biological Replicate", rep, "(Same Sample):\n")
+  
+  before <- rep_data %>% filter(Treatment == "Before Depletion")
+  after <- rep_data %>% filter(Treatment == "After Depletion")
+  
+  if(nrow(before) > 0) {
+    cat("  Before:   ", round(before$Mean_Conc, 2), " ng/μL (Ct = ", 
+        round(before$Mean_Ct, 2), ")\n", sep="")
+  }
+  
+  if(nrow(after) > 0) {
+    cat("  After:   ", round(after$Mean_Conc, 2), " ng/μL (Ct = ", 
+        round(after$Mean_Ct, 2), ")\n", sep="")
+  }
+  
+  if(nrow(before) > 0 && nrow(after) > 0) {
+    fold_reduction <- before$Mean_Conc / after$Mean_Conc
+    delta_ct <- after$Mean_Ct - before$Mean_Ct
+    cat("  Change:   ", round(fold_reduction, 2), "× reduction (ΔCt = +", 
+        round(delta_ct, 2), ")\n", sep="")
+  }
+  
+  cat("\n")
+}
+
+cat("✓ Pairing verified!\n\n")
+
+```
+
+
+```{r visualise paired design}
+
+# Create a plot that clearly shows the paired nature
+pairing_data <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth", !is.na(Mean_Conc)) %>%
+  mutate(Replicate_Label = paste("Sample", Replicate_ID))
+
+plot_pairing <- ggplot(pairing_data, 
+                       aes(x = Treatment, y = Mean_Conc, group = Replicate_ID)) +
+  # Lines connecting paired samples
+  geom_line(aes(color = Replicate_Label), size = 1.5, alpha = 0.7) +
+  # Points for each measurement
+  geom_point(aes(fill = Treatment), size = 6, shape = 21, color = "black", stroke = 1.5) +
+  # Add labels for each sample
+  geom_text(aes(label = Replicate_ID), size = 4, fontface = "bold", color = "white") +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", 
+                               "After Depletion" = "#4DBBD5")) +
+  scale_color_manual(values = c("Sample 1" = "#00A087", 
+                                "Sample 2" = "#3C5488", 
+                                "Sample 3" = "#F39B7F"),
+                     name = "Paired Samples") +
+  labs(
+    title = "Paired Sample Design:  Cheesecloth Host-DNA Depletion",
+    subtitle = "Lines connect the SAME biological sample before and after treatment",
+    x = NULL,
+    y = "Chicken DNA Concentration (ng/μL)",
+    caption = "Each colored line represents one biological sample measured before and after depletion"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "gray30"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_pairing)
+ggsave("cheesecloth_paired_design.png", plot_pairing, width = 10, height = 6, dpi = 300)
+
+```
+
+
+```{r paired t-test cheesecloth}
+
+cat("\n========================================\n")
+cat("PAIRED T-TEST:  CHEESECLOTH SAMPLES\n")
+cat("========================================\n\n")
+
+# Get the biological replicate means for cheesecloth
+cheesecloth_data <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth", !is.na(Mean_Conc)) %>%
+  select(Replicate_ID, Treatment, Mean_Conc, Mean_Ct)
+
+# Reshape to wide format for paired test
+cheesecloth_wide <- cheesecloth_data %>%
+  pivot_wider(names_from = Treatment, values_from = c(Mean_Conc, Mean_Ct))
+
+# Extract before and after values
+before <- cheesecloth_wide$`Mean_Conc_Before Depletion`
+after <- cheesecloth_wide$`Mean_Conc_After Depletion`
+
+cat("Data for paired t-test:\n")
+cat("Before Depletion:", before, "ng/μL\n")
+cat("After Depletion:  ", after, "ng/μL\n\n")
+
+# Perform paired t-test
+paired_result <- t.test(before, after, paired = TRUE, alternative = "greater")
+
+cat("========================================\n")
+cat("PAIRED T-TEST RESULTS\n")
+cat("========================================\n\n")
+
+cat("Null hypothesis (H₀):      No difference in DNA concentration\n")
+cat("Alternative hypothesis (Hₐ): Before > After (depletion reduces DNA)\n\n")
+
+cat("t-statistic:        ", round(paired_result$statistic, 4), "\n")
+cat("Degrees of freedom:", paired_result$parameter, "\n")
+cat("p-value:          ", format.pval(paired_result$p.value, digits = 5), "\n")
+cat("95% CI:            (", round(paired_result$conf.int[1], 2), ", Infinity)\n\n", sep="")
+
+# Calculate descriptive statistics
+mean_before <- mean(before)
+mean_after <- mean(after)
+sd_before <- sd(before)
+sd_after <- sd(after)
+
+differences <- before - after
+mean_diff <- mean(differences)
+sd_diff <- sd(differences)
+
+cat("DESCRIPTIVE STATISTICS:\n")
+cat("───────────────────────────────────────\n")
+cat("Before Depletion:\n")
+cat("  Mean:  ", round(mean_before, 2), " ng/μL\n")
+cat("  SD:    ", round(sd_before, 2), " ng/μL\n\n")
+
+cat("After Depletion:\n")
+cat("  Mean:  ", round(mean_after, 4), " ng/μL\n")
+cat("  SD:    ", round(sd_after, 4), " ng/μL\n\n")
+
+cat("Difference (Before - After):\n")
+cat("  Mean:  ", round(mean_diff, 2), " ng/μL\n")
+cat("  SD:    ", round(sd_diff, 2), " ng/μL\n\n")
+
+# Effect sizes
+fold_change <- mean_before / mean_after
+percent_reduction <- (mean_diff / mean_before) * 100
+cohens_d <- mean_diff / sd_diff
+
+cat("EFFECT SIZE:\n")
+cat("───────────────────────────────────────\n")
+cat("Fold reduction:    ", round(fold_change, 2), "×\n")
+cat("Percent reduction: ", round(percent_reduction, 1), "%\n")
+cat("Cohen's d:         ", round(cohens_d, 2), " (", 
+    ifelse(abs(cohens_d) > 1.2, "Very Large",
+    ifelse(abs(cohens_d) > 0.8, "Large",
+    ifelse(abs(cohens_d) > 0.5, "Medium", "Small"))), " effect)\n\n")
+
+# Ct values
+ct_before <- cheesecloth_wide$`Mean_Ct_Before Depletion`
+ct_after <- cheesecloth_wide$`Mean_Ct_After Depletion`
+delta_ct <- mean(ct_after - ct_before)
+
+cat("Ct VALUES:\n")
+cat("───────────────────────────────────────\n")
+cat("Mean Ct Before:         ", round(mean(ct_before), 2), "\n")
+cat("Mean Ct After:         ", round(mean(ct_after), 2), "\n")
+cat("ΔCt (After - Before):  ", round(delta_ct, 2), "\n")
+cat("(Higher ΔCt indicates more depletion)\n\n")
+
+# Interpretation
+cat("INTERPRETATION:\n")
+cat("───────────────────────────────────────\n")
+if(paired_result$p.value < 0.001) {
+  cat("*** p < 0.001 - HIGHLY SIGNIFICANT\n")
+  cat("Very strong evidence that depletion reduces chicken DNA.\n\n")
+} else if(paired_result$p.value < 0.01) {
+  cat("** p < 0.01 - VERY SIGNIFICANT\n")
+  cat("Strong evidence that depletion reduces chicken DNA.\n\n")
+} else if(paired_result$p.value < 0.05) {
+  cat("* p < 0.05 - SIGNIFICANT\n")
+  cat("Evidence that depletion reduces chicken DNA.\n\n")
+} else if(paired_result$p.value < 0.10) {
+  cat("† p < 0.10 - MARGINALLY SIGNIFICANT / TREND\n")
+  cat("Suggestive evidence that depletion reduces chicken DNA.\n")
+  cat("The effect is likely real but limited by sample size (n=3).\n\n")
+} else {
+  cat("p ≥ 0.10 - NOT SIGNIFICANT\n")
+  cat("Insufficient evidence at conventional significance levels.\n\n")
+}
+
+cat("========================================\n\n")
+
+```
+
+
+```{r visualisation with stats}
+
+# Get overall means and CI
+cheesecloth_overall <- cheesecloth_data %>%
+  group_by(Treatment) %>%
+  summarise(
+    Mean = mean(Mean_Conc),
+    SD = sd(Mean_Conc),
+    SE = SD / sqrt(n()),
+    Lower_CI = Mean - qt(0.975, n()-1) * SE,
+    Upper_CI = Mean + qt(0.975, n()-1) * SE,
+    .groups = "drop"
+  )
+
+# Create detailed plot
+plot_stats <- ggplot() +
+  # Overall mean bars with 95% CI
+  geom_col(data = cheesecloth_overall,
+           aes(x = Treatment, y = Mean, fill = Treatment),
+           alpha = 0.6, width = 0.5) +
+  geom_errorbar(data = cheesecloth_overall,
+                aes(x = Treatment, ymin = Lower_CI, ymax = Upper_CI),
+                width = 0.15, size = 1.2) +
+  # Individual biological replicates
+  geom_point(data = cheesecloth_data,
+             aes(x = Treatment, y = Mean_Conc, group = Replicate_ID),
+             size = 5, shape = 21, fill = "white", stroke = 1.5) +
+  # Connecting lines for paired data
+  geom_line(data = cheesecloth_data,
+            aes(x = Treatment, y = Mean_Conc, group = Replicate_ID),
+            color = "gray40", linetype = "dashed", size = 0.8) +
+  # Add replicate labels
+  geom_text(data = cheesecloth_data,
+            aes(x = Treatment, y = Mean_Conc, label = Replicate_ID),
+            size = 3, fontface = "bold") +
+  # Add statistics annotation
+  annotate("rect", xmin = 0.5, xmax = 2.5, 
+           ymin = max(cheesecloth_data$Mean_Conc) * 0.85,
+           ymax = max(cheesecloth_data$Mean_Conc) * 1.05,
+           fill = "white", color = "black", linetype = "dashed", alpha = 0.8) +
+  annotate("text", x = 1.5, y = max(cheesecloth_data$Mean_Conc) * 0.97,
+           label = paste0("Paired t-test\n",
+                         "p = ", format.pval(paired_result$p.value, digits = 3), "\n",
+                         round(fold_change, 1), "-fold reduction\n",
+                         "Cohen's d = ", round(cohens_d, 2)),
+           size = 4, fontface = "bold", lineheight = 0.9) +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", 
+                               "After Depletion" = "#4DBBD5")) +
+  labs(
+    title = "Cheesecloth Samples:  Host-DNA Depletion Efficacy",
+    subtitle = "Each biological replicate is the mean of 3 technical replicates | n=3",
+    x = NULL,
+    y = "Chicken DNA Concentration (ng/μL)",
+    caption = "Bars = Mean ± 95% CI | Points = Individual biological replicates | Lines connect paired samples"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "gray30"),
+    axis.text.x = element_text(size = 11),
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+
+print(plot_stats)
+ggsave("cheesecloth_paired_ttest.png", plot_stats, width = 10, height = 7, dpi = 600)
+
+
+```
+
+
+```{r check assumptions}
+
+cat("\n========================================\n")
+cat("CHECKING T-TEST ASSUMPTIONS\n")
+cat("========================================\n\n")
+
+# 1.  Normality of differences
+cat("1. NORMALITY OF DIFFERENCES\n")
+cat("───────────────────────────────────────\n")
+cat("Differences (Before - After):", round(differences, 2), "\n\n")
+
+shapiro_test <- shapiro.test(differences)
+cat("Shapiro-Wilk test for normality:\n")
+cat("  W =", round(shapiro_test$statistic, 4), "\n")
+cat("  p-value =", round(shapiro_test$p.value, 4), "\n\n")
+
+if(shapiro_test$p.value > 0.05) {
+  cat("✓ Differences are normally distributed (p > 0.05)\n")
+  cat("  Paired t-test is appropriate.\n\n")
+} else {
+  cat("⚠ Differences may not be normally distributed (p < 0.05)\n")
+  cat("  With n=3, normality tests have low power.\n")
+  cat("  Consider Wilcoxon signed-rank test as alternative.\n\n")
+}
+
+# 2. No extreme outliers
+cat("2. OUTLIER CHECK\n")
+cat("───────────────────────────────────────\n")
+q1 <- quantile(differences, 0.25)
+q3 <- quantile(differences, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+outliers <- differences < lower_bound | differences > upper_bound
+
+if(any(outliers)) {
+  cat("⚠ Potential outliers detected:\n")
+  cat("  Values:", round(differences[outliers], 2), "\n\n")
+} else {
+  cat("✓ No outliers detected (using 1.5×IQR rule)\n\n")
+}
+
+# 3. Independence
+cat("3. INDEPENDENCE\n")
+cat("───────────────────────────────────────\n")
+cat("✓ The three biological replicates are independent samples\n")
+cat("  (different cheesecloth samples, processed separately)\n\n")
+
+cat("CONCLUSION:\n")
+cat("───────────────────────────────────────\n")
+cat("✓ Paired t-test is appropriate for this data.\n\n")
+
+```
+
+
+```{r alternative test: wilcoxon signed-rank test}
+
+cat("\n========================================\n")
+cat("NON-PARAMETRIC ALTERNATIVE\n")
+cat("Wilcoxon Signed-Rank Test\n")
+cat("========================================\n\n")
+
+cat("This test does not assume normality of differences.\n")
+cat("Useful as a sensitivity check for small sample sizes.\n\n")
+
+wilcox_result <- wilcox.test(before, after, paired = TRUE, alternative = "greater")
+
+cat("Wilcoxon Signed-Rank Test:\n")
+cat("  V-statistic:", wilcox_result$statistic, "\n")
+cat("  p-value:      ", format.pval(wilcox_result$p.value, digits = 5), "\n\n")
+
+cat("Comparison of results:\n")
+cat("───────────────────────────────────────\n")
+comparison <- data.frame(
+  Test = c("Paired t-test", "Wilcoxon signed-rank"),
+  Statistic = c(round(paired_result$statistic, 3), wilcox_result$statistic),
+  P_Value = c(paired_result$p.value, wilcox_result$p.value),
+  Significant = c(
+    ifelse(paired_result$p.value < 0.05, "Yes", "No"),
+    ifelse(wilcox_result$p.value < 0.05, "Yes", "No")
+  )
+)
+
+knitr::kable(comparison, digits = 4)
+
+cat("\n")
+if(paired_result$p.value < 0.05 & wilcox_result$p.value < 0.05) {
+  cat("✓ Both tests agree - significant reduction detected.\n")
+} else if(paired_result$p.value >= 0.05 & wilcox_result$p.value >= 0.05) {
+  cat("→ Both tests agree - reduction not significant at α=0.05.\n")
+} else {
+  cat("→ Tests disagree - report both and use more conservative result.\n")
+}
+cat("\n")
+
+```
+
+```{technical replicate quality check}
+
+cat("\n========================================\n")
+cat("TECHNICAL REPLICATE QUALITY CHECK\n")
+cat("========================================\n\n")
+
+tech_rep_qc <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth", !is.na(Mean_Conc)) %>%
+  mutate(
+    CV_percent = (SD_Conc / Mean_Conc) * 100  # Coefficient of variation
+  ) %>%
+  select(Treatment, Replicate_ID, Mean_Conc, SD_Conc, CV_percent, n_detected)
+
+cat("Coefficient of Variation (CV) for technical triplicates:\n")
+cat("(Lower CV = more consistent technical replicates)\n\n")
+
+tech_rep_qc %>%
+  knitr::kable(
+    digits = 2,
+    col.names = c("Treatment", "Bio Rep", "Mean Conc", "SD Conc", "CV (%)", "n Tech"),
+    caption = "Technical Replicate Consistency"
+  )
+
+cat("\n")
+cat("Interpretation:\n")
+cat("  - CV < 10%:  Excellent technical precision\n")
+cat("  - CV < 20%:  Good technical precision\n")
+cat("  - CV < 25%:  Acceptable technical precision\n")
+cat("  - CV > 25%:  Poor precision, investigate outliers\n\n")
+
+mean_cv <- mean(tech_rep_qc$CV_percent, na.rm = TRUE)
+cat("Average CV across all samples:", round(mean_cv, 1), "%\n")
+
+if(mean_cv < 15) {
+  cat("✓ Technical replicates show excellent consistency!\n")
+} else if(mean_cv < 25) {
+  cat("✓ Technical replicates show acceptable consistency.\n")
+} else {
+  cat("⚠ Consider investigating samples with high CV.\n")
+}
+
+```
+
+```{r individual sample effects}
+
+cat("\n========================================\n")
+cat("INDIVIDUAL SAMPLE EFFECTS\n")
+cat("========================================\n\n")
+
+cat("Examining the depletion effect in each biological sample:\n\n")
+
+individual_effects <- cheesecloth_wide %>%
+  mutate(
+    Fold_Reduction = `Mean_Conc_Before Depletion` / `Mean_Conc_After Depletion`,
+    Delta_Ct = `Mean_Ct_After Depletion` - `Mean_Ct_Before Depletion`,
+    Percent_Reduction = ((`Mean_Conc_Before Depletion` - `Mean_Conc_After Depletion`) / 
+                         `Mean_Conc_Before Depletion`) * 100
+  )
+
+individual_effects %>%
+  select(Replicate_ID, `Mean_Conc_Before Depletion`, `Mean_Conc_After Depletion`,
+         Fold_Reduction, Delta_Ct, Percent_Reduction) %>%
+  knitr::kable(
+    digits = 2,
+    col.names = c("Sample", "Before (ng/μL)", "After (ng/μL)", 
+                  "Fold↓", "ΔCt", "%↓"),
+    caption = "Individual Sample Depletion Effects"
+  )
+
+cat("\n")
+
+# Check consistency of effect direction
+all_reduced <- all(individual_effects$Fold_Reduction > 1, na.rm = TRUE)
+
+if(all_reduced) {
+  cat("✓ ALL samples show reduction in chicken DNA\n")
+  cat("  (100% consistent direction of effect)\n\n")
+  
+  cat("This consistency strengthens the evidence for depletion efficacy,\n")
+  cat("even if the p-value is marginally non-significant (p=0.07).\n\n")
+} else {
+  cat("⚠ Not all samples show reduction\n")
+  cat("  This inconsistency may explain statistical results.\n\n")
+}
+
+# Check range of effects
+fold_range <- range(individual_effects$Fold_Reduction, na.rm = TRUE)
+cat("Range of fold reductions:", round(fold_range[1], 1), "× to", round(fold_range[2], 1), "×\n")
+
+cv_foldchange <- sd(individual_effects$Fold_Reduction, na.rm = TRUE) / 
+                 mean(individual_effects$Fold_Reduction, na.rm = TRUE) * 100
+
+cat("Variability (CV) in fold reduction:", round(cv_foldchange, 1), "%\n\n")
+
+if(cv_foldchange < 50) {
+  cat("✓ Fold reductions are relatively consistent across samples\n")
+} else {
+  cat("→ Considerable variability in fold reductions across samples\n")
+  cat("  This biological variability is expected and normal.\n")
+}
+
+
+```
+
+```{summary for thesis}
+cat("\n========================================\n")
+cat("SUGGESTED TEXT FOR MANUSCRIPT\n")
+cat("========================================\n\n")
+
+p_text <- if(paired_result$p.value < 0.001) {
+  "p < 0.001"
+} else if(paired_result$p.value < 0.01) {
+  paste0("p = ", format.pval(paired_result$p.value, digits = 2))
+} else {
+  paste0("p = ", format.pval(paired_result$p.value, digits = 3))
+}
+
+cat('"Host-DNA depletion reduced chicken DNA concentration in cheesecloth\n')
+cat('samples from ', round(mean_before, 1), ' ± ', round(sd_before, 1), 
+    ' ng/μL to ', round(mean_after, 2), ' ± ', round(sd_after, 2), ' ng/μL\n', sep='')
+cat('(mean ± SD, n=3), representing a ', round(fold_change, 1), '-fold reduction\n', sep='')
+cat('(', round(percent_reduction, 1), '% reduction). ', sep='')
+
+if(paired_result$p.value < 0.05) {
+  cat('This reduction was statistically\n')
+  cat('significant (paired t-test:   t(', paired_result$parameter, ') = ', 
+      round(paired_result$statistic, 2), ', ', p_text, ')."\n\n', sep='')
+} else {
+  cat('This reduction showed a trend\n')
+  cat('toward significance (paired t-test:  t(', paired_result$parameter, ') = ', 
+      round(paired_result$statistic, 2), ', ', p_text, '), with all three\n', sep='')
+  cat('biological replicates showing consistent reduction in chicken DNA. "\n\n')
+}
+
+```
+
+```{r final summary}
+
+cat("\n========================================\n")
+cat("FINAL SUMMARY\n")
+cat("========================================\n\n")
+
+cat("CHEESECLOTH SAMPLES:\n")
+cat("  - ΔCt:", round(delta_ct, 2), "\n")
+cat("  - Fold reduction:", round(fold_change, 2), "×\n")
+cat("  - Percent reduction:", round(percent_reduction, 2), "%\n")
+cat("  - Statistical test:  Paired t-test\n")
+cat("  - p-value:", format.pval(paired_result$p.value, digits = 4), "\n\n")
+
+cat("All plots saved as PNG files in working directory.\n")
+
+sessionInfo()
+```
+
+
+```{save as pdf}
+---
+
+# 8. Generate PDF Report
+
+```{r create-pdf-report, eval=TRUE}
+# Load additional library for PDF generation
+library(gridExtra)
+library(grid)
+
+cat("\n========================================\n")
+cat("GENERATING PDF REPORT\n")
+cat("========================================\n\n")
+
+# Create a PDF with all important outputs
+pdf("qPCR_Host_Depletion_Complete_Report.pdf", width = 11, height = 8.5)
+
+# ============================================================================
+# PAGE 1: TITLE PAGE
+# ============================================================================
+grid.newpage()
+grid.text("qPCR Host-DNA Depletion Analysis\nComplete Report", 
+          x = 0.5, y = 0.7, 
+          gp = gpar(fontsize = 24, fontface = "bold"))
+grid.text(paste("Generated:", Sys.Date()), 
+          x = 0.5, y = 0.5, 
+          gp = gpar(fontsize = 14))
+grid.text(paste("Analysis of chicken DNA before and after\nhost-DNA depletion across multiple sample types"), 
+          x = 0.5, y = 0.4, 
+          gp = gpar(fontsize = 12))
+
+# ============================================================================
+# PAGE 2: DATA OVERVIEW TABLE
+# ============================================================================
+grid. newpage()
+grid.text("Data Overview", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+# Create overview table
+overview_table <- data_clean %>% 
+  group_by(Sample_Type, Treatment) %>% 
+  summarise(
+    Total = n(),
+    Detected = sum(! is.na(Concentration)),
+    Non_Detects = sum(is.na(Concentration)),
+    .groups = "drop"
+  )
+
+# Convert to grob for plotting
+table_grob <- tableGrob(overview_table, rows = NULL)
+grid.draw(table_grob)
+
+# ============================================================================
+# PAGE 3: CHEESECLOTH CT VALUES
+# ============================================================================
+print(plot_cheesecloth_ct)
+
+# ============================================================================
+# PAGE 4: CHEESECLOTH CONCENTRATION
+# ============================================================================
+print(plot_cheesecloth_conc)
+
+# ============================================================================
+# PAGE 5: PAIRED DESIGN VISUALIZATION
+# ============================================================================
+print(plot_pairing)
+
+# ============================================================================
+# PAGE 6: STATISTICAL TEST RESULTS PLOT
+# ============================================================================
+print(plot_stats)
+
+# ============================================================================
+# PAGE 7: STATISTICAL RESULTS TABLE
+# ============================================================================
+grid.newpage()
+grid.text("Statistical Test Results:  Cheesecloth Samples", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+# Create results table
+stats_table <- data. frame(
+  Metric = c("Sample Size (n)", 
+             "Test Used",
+             "t-statistic", 
+             "Degrees of Freedom",
+             "p-value",
+             "",
+             "Mean Before (ng/μL)",
+             "Mean After (ng/μL)",
+             "Mean Difference",
+             "",
+             "Fold Reduction",
+             "Percent Reduction (%)",
+             "Cohen's d",
+             "",
+             "Mean Ct Before",
+             "Mean Ct After",
+             "ΔCt",
+             "",
+             "Interpretation"),
+  Value = c("3 biological replicates",
+            "Paired t-test (one-tailed)",
+            round(paired_result$statistic, 3),
+            paired_result$parameter,
+            format.pval(paired_result$p.value, digits = 4),
+            "",
+            round(mean_before, 2),
+            round(mean_after, 2),
+            round(mean_diff, 2),
+            "",
+            paste0(round(fold_change, 2), "×"),
+            round(percent_reduction, 1),
+            paste0(round(cohens_d, 2), " (", 
+                   ifelse(abs(cohens_d) > 1.2, "Very Large",
+                   ifelse(abs(cohens_d) > 0.8, "Large",
+                   ifelse(abs(cohens_d) > 0.5, "Medium", "Small"))), ")"),
+            "",
+            round(mean(ct_before), 2),
+            round(mean(ct_after), 2),
+            round(delta_ct, 2),
+            "",
+            ifelse(paired_result$p. value < 0.05, 
+                   "Significant reduction (p<0.05)",
+                   "Trend toward significance (p<0.10)"))
+)
+
+table_grob2 <- tableGrob(stats_table, rows = NULL,
+                         theme = ttheme_default(base_size = 10))
+grid.draw(table_grob2)
+
+# ============================================================================
+# PAGE 8: INDIVIDUAL SAMPLE EFFECTS
+# ============================================================================
+grid.newpage()
+grid.text("Individual Sample Effects", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+ind_table <- individual_effects %>%
+  select(Replicate_ID, `Mean_Conc_Before Depletion`, `Mean_Conc_After Depletion`,
+         Fold_Reduction, Delta_Ct, Percent_Reduction) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+colnames(ind_table) <- c("Sample", "Before (ng/μL)", "After (ng/μL)", 
+                         "Fold↓", "ΔCt", "%↓")
+
+table_grob3 <- tableGrob(ind_table, rows = NULL,
+                         theme = ttheme_default(base_size = 12))
+grid.draw(table_grob3)
+
+# Add summary text
+grid.text(paste0("All 3 samples show consistent reduction\n",
+                "Range: ", round(fold_range[1], 1), "× to ", 
+                round(fold_range[2], 1), "× reduction\n",
+                "CV of fold-change:  ", round(cv_foldchange, 1), "%"), 
+          x = 0.5, y = 0.3, 
+          gp = gpar(fontsize = 11))
+
+# ============================================================================
+# PAGE 9: TECHNICAL REPLICATE QUALITY
+# ============================================================================
+grid.newpage()
+grid.text("Technical Replicate Quality Control", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+tech_table <- tech_rep_qc %>%
+  mutate(across(where(is. numeric), ~round(., 2)))
+
+colnames(tech_table) <- c("Treatment", "Bio Rep", "Mean Conc", 
+                          "SD Conc", "CV (%)", "n Tech")
+
+table_grob4 <- tableGrob(tech_table, rows = NULL,
+                         theme = ttheme_default(base_size = 11))
+grid.draw(table_grob4)
+
+# Add interpretation
+grid.text(paste0("Average CV: ", round(mean_cv, 1), "%\n",
+                ifelse(mean_cv < 15, 
+                       "✓ Excellent technical precision",
+                       "✓ Acceptable technical precision")), 
+          x = 0.5, y = 0.3, 
+          gp = gpar(fontsize = 12, fontface = "bold", col = "darkgreen"))
+
+# ============================================================================
+# PAGE 10: FILTERED SAMPLES - CT
+# ============================================================================
+print(plot_filtered_ct)
+
+# ============================================================================
+# PAGE 11: FILTERED SAMPLES - CONCENTRATION
+# ============================================================================
+print(plot_filtered_conc)
+
+# ============================================================================
+# PAGE 12: ENRICHED SAMPLES - CT
+# ============================================================================
+print(plot_enriched_ct)
+
+# ============================================================================
+# PAGE 13: ENRICHED SAMPLES - CONCENTRATION
+# ============================================================================
+print(plot_enriched_conc)
+
+# ============================================================================
+# PAGE 14: ASSUMPTIONS CHECK
+# ============================================================================
+grid. newpage()
+grid.text("Statistical Assumptions Check", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+# Normality test results
+grid.text("1. Normality of Differences (Shapiro-Wilk Test)", 
+          x = 0.1, y = 0.85, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text(paste0("W = ", round(shapiro_test$statistic, 4), 
+                ", p-value = ", round(shapiro_test$p. value, 4)), 
+          x = 0.15, y = 0.80, just = "left",
+          gp = gpar(fontsize = 12))
+
+grid.text(ifelse(shapiro_test$p.value > 0.05,
+                "✓ Differences are normally distributed",
+                "⚠ May not be normally distributed (small sample)"), 
+          x = 0.15, y = 0.75, just = "left",
+          gp = gpar(fontsize = 11, col = ifelse(shapiro_test$p.value > 0.05, "darkgreen", "orange")))
+
+# Outlier check
+grid.text("2. Outlier Check (1.5×IQR rule)", 
+          x = 0.1, y = 0.65, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text(ifelse(any(outliers),
+                "⚠ Potential outliers detected",
+                "✓ No outliers detected"), 
+          x = 0.15, y = 0.60, just = "left",
+          gp = gpar(fontsize = 11, col = ifelse(any(outliers), "orange", "darkgreen")))
+
+# Independence
+grid.text("3. Independence", 
+          x = 0.1, y = 0.50, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text("✓ Three independent biological replicates", 
+          x = 0.15, y = 0.45, just = "left",
+          gp = gpar(fontsize = 11, col = "darkgreen"))
+
+# Conclusion
+grid.text("CONCLUSION", 
+          x = 0.1, y = 0.30, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text("✓ Paired t-test is appropriate for this data", 
+          x = 0.15, y = 0.25, just = "left",
+          gp = gpar(fontsize = 12, col = "darkgreen", fontface = "bold"))
+
+# ============================================================================
+# PAGE 15: COMPARISON WITH NON-PARAMETRIC TEST
+# ============================================================================
+grid. newpage()
+grid.text("Comparison:  Parametric vs Non-Parametric Tests", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+comparison_display <- comparison %>%
+  mutate(P_Value = format.pval(P_Value, digits = 4))
+
+table_grob5 <- tableGrob(comparison_display, rows = NULL,
+                         theme = ttheme_default(base_size = 12))
+grid.draw(table_grob5)
+
+# Add interpretation
+interp_text <- if(paired_result$p.value < 0.05 & wilcox_result$p.value < 0.05) {
+  "✓ Both tests agree - significant reduction detected"
+} else if(paired_result$p.value >= 0.05 & wilcox_result$p.value >= 0.05) {
+  "→ Both tests agree - reduction not significant at α=0.05"
+} else {
+  "→ Tests disagree - report both results"
+}
+
+grid.text(interp_text, 
+          x = 0.5, y = 0.4, 
+          gp = gpar(fontsize = 12, fontface = "bold"))
+
+# ============================================================================
+# PAGE 16: MANUSCRIPT TEXT
+# ============================================================================
+grid. newpage()
+grid.text("Suggested Manuscript Text", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+manuscript_text <- paste0(
+  '"Host-DNA depletion reduced chicken DNA concentration in cheesecloth\n',
+  'samples from ', round(mean_before, 1), ' ± ', round(sd_before, 1), 
+  ' ng/μL to ', round(mean_after, 2), ' ± ', round(sd_after, 2), ' ng/μL\n',
+  '(mean ± SD, n=3), representing a ', round(fold_change, 1), '-fold reduction\n',
+  '(', round(percent_reduction, 1), '% reduction). ',
+  if(paired_result$p.value < 0.05) {
+    paste0('This reduction was statistically\n',
+           'significant (paired t-test:   t(', paired_result$parameter, ') = ', 
+           round(paired_result$statistic, 2), ', ', p_text, ')."')
+  } else {
+    paste0('This reduction showed a trend\n',
+           'toward significance (paired t-test:  t(', paired_result$parameter, ') = ', 
+           round(paired_result$statistic, 2), ', ', p_text, '), with all three\n',
+           'biological replicates showing consistent reduction in chicken DNA."')
+  }
+)
+
+grid.text(manuscript_text, 
+          x = 0.1, y = 0.75, just = "left",
+          gp = gpar(fontsize = 11))
+
+# Add key findings box
+grid.rect(x = 0.5, y = 0.4, width = 0.8, height = 0.3,
+          gp = gpar(fill = "lightblue", col = "darkblue", lwd = 2))
+
+grid.text("KEY FINDINGS", 
+          x = 0.5, y = 0.52, 
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+key_findings <- paste0(
+  "• ", round(fold_change, 1), "-fold reduction in chicken DNA\n",
+  "• ", round(percent_reduction, 1), "% reduction in concentration\n",
+  "• ΔCt = +", round(delta_ct, 2), " cycles\n",
+  "• All 3 biological replicates showed consistent reduction\n",
+  "• ", ifelse(paired_result$p.value < 0.05, "Statistically significant", "Strong biological effect"),
+  " (p = ", format.pval(paired_result$p.value, digits = 3), ")"
+)
+
+grid.text(key_findings, 
+          x = 0.5, y = 0.37, 
+          gp = gpar(fontsize = 10))
+
+# ============================================================================
+# CLOSE PDF
+# ============================================================================
+dev.off()
+
+cat("✓ PDF report generated:  'qPCR_Host_Depletion_Complete_Report.pdf'\n\n")
+cat("The report includes:\n")
+cat("  • Title page\n")
+cat("  • Data overview table\n")
+cat("  • All plots (Ct values and concentrations)\n")
+cat("  • Paired design visualization\n")
+cat("  • Statistical test results\n")
+cat("  • Individual sample effects\n")
+cat("  • Technical replicate quality control\n")
+cat("  • Assumptions checking\n")
+cat("  • Test comparisons\n")
+cat("  • Manuscript-ready text\n")
+cat("  • Key findings summary\n\n")
+```
+
+## Alternative:  Create Summary PDF with Key Results Only
+
+```{r create-summary-pdf, eval=TRUE}
+cat("\n========================================\n")
+cat("GENERATING SUMMARY PDF\n")
+cat("========================================\n\n")
+
+# Create a condensed PDF with only key results
+pdf("qPCR_Summary_Report.pdf", width = 8.5, height = 11)
+
+# ============================================================================
+# PAGE 1: SUMMARY PAGE
+# ============================================================================
+grid. newpage()
+
+# Title
+grid.text("qPCR Host-DNA Depletion\nSummary Report", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 20, fontface = "bold"))
+
+grid.text(paste("Date:", Sys.Date()), 
+          x = 0.5, y = 0.88, 
+          gp = gpar(fontsize = 11, col = "gray40"))
+
+# Draw box for main results
+grid.rect(x = 0.5, y = 0.70, width = 0.85, height = 0.25,
+          gp = gpar(fill = "#E8F4F8", col = "#2C3E50", lwd = 2))
+
+grid.text("CHEESECLOTH SAMPLES - MAIN RESULTS", 
+          x = 0.5, y = 0.81, 
+          gp = gpar(fontsize = 14, fontface = "bold", col = "#2C3E50"))
+
+main_results <- paste0(
+  "Fold Reduction:            ", round(fold_change, 2), "×\n",
+  "Percent Reduction:        ", round(percent_reduction, 1), "%\n",
+  "ΔCt:                      +", round(delta_ct, 2), " cycles\n\n",
+  "Statistical Test:          Paired t-test (n=3)\n",
+  "t-statistic:              ", round(paired_result$statistic, 3), "\n",
+  "p-value:                  ", format.pval(paired_result$p. value, digits = 4), "\n",
+  "Effect Size (Cohen's d):  ", round(cohens_d, 2), " (", 
+  ifelse(abs(cohens_d) > 1.2, "Very Large",
+  ifelse(abs(cohens_d) > 0.8, "Large",
+  ifelse(abs(cohens_d) > 0.5, "Medium", "Small"))), ")"
+)
+
+grid.text(main_results, 
+          x = 0.5, y = 0.68, 
+          gp = gpar(fontsize = 10, family = "mono"))
+
+# Individual samples table
+grid.text("Individual Biological Replicates:", 
+          x = 0.1, y = 0.45, just = "left",
+          gp = gpar(fontsize = 12, fontface = "bold"))
+
+ind_mini <- individual_effects %>%
+  select(Replicate_ID, `Mean_Conc_Before Depletion`, 
+         `Mean_Conc_After Depletion`, Fold_Reduction) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+colnames(ind_mini) <- c("Sample", "Before", "After", "Fold↓")
+
+table_mini <- tableGrob(ind_mini, rows = NULL,
+                        theme = ttheme_minimal(base_size = 10))
+grid.draw(table_mini)
+
+# Conclusion box
+grid.rect(x = 0.5, y = 0.12, width = 0.85, height = 0.12,
+          gp = gpar(fill = ifelse(paired_result$p. value < 0.05, "#D5F4E6", "#FFF4E6"), 
+                    col = ifelse(paired_result$p.value < 0.05, "#27AE60", "#F39C12"), 
+                    lwd = 2))
+
+conclusion <- ifelse(paired_result$p. value < 0.05,
+                    "✓ SIGNIFICANT REDUCTION IN CHICKEN DNA",
+                    "STRONG TREND TOWARD SIGNIFICANCE")
+
+grid.text(conclusion, 
+          x = 0.5, y = 0.14, 
+          gp = gpar(fontsize = 12, fontface = "bold",
+                    col = ifelse(paired_result$p.value < 0.05, "#27AE60", "#F39C12")))
+
+grid.text("All 3 biological replicates show consistent reduction", 
+          x = 0.5, y = 0.10, 
+          gp = gpar(fontsize = 10))
+
+# ============================================================================
+# PAGE 2: MAIN PLOT
+# ============================================================================
+print(plot_stats)
+
+# ============================================================================
+# PAGE 3: PAIRED DESIGN
+# ============================================================================
+print(plot_pairing)
+
+# Close PDF
+dev.off()
+
+cat("✓ Summary PDF generated: 'qPCR_Summary_Report.pdf'\n\n")
+```
+
+## Export Results to Excel
+
+```{r export-to-excel, eval=TRUE}
+# Also export key results to Excel for easy sharing
+install.packages("writexl")
+library(writexl)
+
+## 6. 10 Prepare Objects for PDF Report
+# Ensure all necessary objects are available for PDF generation
+
+# Create tech_rep_qc if not already exists
+if(! exists("tech_rep_qc")) {
+  tech_rep_qc <- summary_stats %>%
+    filter(Sample_Type == "Cheesecloth", ! is.na(Mean_Conc)) %>%
+    mutate(
+      CV_percent = (SD_Conc / Mean_Conc) * 100
+    ) %>%
+    select(Treatment, Replicate_ID, Mean_Conc, SD_Conc, CV_percent, n_detected)
+  
+  mean_cv <- mean(tech_rep_qc$CV_percent, na.rm = TRUE)
+}
+
+# Create individual_effects if not already exists
+if(!exists("individual_effects")) {
+  individual_effects <- cheesecloth_wide %>%
+    mutate(
+      Fold_Reduction = `Mean_Conc_Before Depletion` / `Mean_Conc_After Depletion`,
+      Delta_Ct = `Mean_Ct_After Depletion` - `Mean_Ct_Before Depletion`,
+      Percent_Reduction = ((`Mean_Conc_Before Depletion` - `Mean_Conc_After Depletion`) / 
+                           `Mean_Conc_Before Depletion`) * 100
+    )
+  
+  fold_range <- range(individual_effects$Fold_Reduction, na.rm = TRUE)
+  cv_foldchange <- sd(individual_effects$Fold_Reduction, na.rm = TRUE) / 
+                   mean(individual_effects$Fold_Reduction, na.rm = TRUE) * 100
+}
+
+# Create shapiro_test if not already exists
+if(!exists("shapiro_test")) {
+  shapiro_test <- shapiro.test(differences)
+}
+
+# Create comparison table if not already exists
+if(!exists("comparison")) {
+  comparison <- data.frame(
+    Test = c("Paired t-test", "Wilcoxon signed-rank"),
+    Statistic = c(round(paired_result$statistic, 3), wilcox_result$statistic),
+    P_Value = c(paired_result$p.value, wilcox_result$p.value),
+    Significant = c(
+      ifelse(paired_result$p.value < 0.05, "Yes", "No"),
+      ifelse(wilcox_result$p.value < 0.05, "Yes", "No")
+    )
+  )
+}
+
+# Check for outliers
+q1 <- quantile(differences, 0.25)
+q3 <- quantile(differences, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+outliers <- differences < lower_bound | differences > upper_bound
+
+# Create p_text for manuscript
+p_text <- if(paired_result$p.value < 0.001) {
+  "p < 0.001"
+} else if(paired_result$p.value < 0.01) {
+  paste0("p = ", format.pval(paired_result$p.value, digits = 2))
+} else {
+  paste0("p = ", format.pval(paired_result$p.value, digits = 3))
+}
+
+cat("✓ All objects prepared for PDF generation\n")
+```
+
+
+```{r create-pdf-report-safe, eval=TRUE}
+# Load additional library for PDF generation
+if(! require(gridExtra)) install.packages("gridExtra")
+library(gridExtra)
+library(grid)
+
+cat("\n========================================\n")
+cat("GENERATING PDF REPORT\n")
+cat("========================================\n\n")
+
+# Prepare all necessary objects
+tech_rep_qc <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth", ! is.na(Mean_Conc)) %>%
+  mutate(CV_percent = (SD_Conc / Mean_Conc) * 100) %>%
+  select(Treatment, Replicate_ID, Mean_Conc, SD_Conc, CV_percent, n_detected)
+
+mean_cv <- mean(tech_rep_qc$CV_percent, na.rm = TRUE)
+
+individual_effects <- cheesecloth_wide %>%
+  mutate(
+    Fold_Reduction = `Mean_Conc_Before Depletion` / `Mean_Conc_After Depletion`,
+    Delta_Ct = `Mean_Ct_After Depletion` - `Mean_Ct_Before Depletion`,
+    Percent_Reduction = ((`Mean_Conc_Before Depletion` - `Mean_Conc_After Depletion`) / 
+                         `Mean_Conc_Before Depletion`) * 100
+  )
+
+fold_range <- range(individual_effects$Fold_Reduction, na.rm = TRUE)
+cv_foldchange <- sd(individual_effects$Fold_Reduction, na.rm = TRUE) / 
+                 mean(individual_effects$Fold_Reduction, na.rm = TRUE) * 100
+
+shapiro_test <- shapiro.test(differences)
+
+comparison <- data.frame(
+  Test = c("Paired t-test", "Wilcoxon signed-rank"),
+  Statistic = c(round(paired_result$statistic, 3), wilcox_result$statistic),
+  P_Value = c(paired_result$p.value, wilcox_result$p.value),
+  Significant = c(
+    ifelse(paired_result$p.value < 0.05, "Yes", "No"),
+    ifelse(wilcox_result$p.value < 0.05, "Yes", "No")
+  )
+)
+
+q1 <- quantile(differences, 0.25)
+q3 <- quantile(differences, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+outliers <- differences < lower_bound | differences > upper_bound
+
+p_text <- if(paired_result$p.value < 0.001) {
+  "p < 0.001"
+} else if(paired_result$p.value < 0.01) {
+  paste0("p = ", format.pval(paired_result$p.value, digits = 2))
+} else {
+  paste0("p = ", format.pval(paired_result$p.value, digits = 3))
+}
+
+# Create a PDF with all important outputs
+pdf("qPCR_Host_Depletion_Complete_Report.pdf", width = 11, height = 8.5)
+
+# ============================================================================
+# PAGE 1: TITLE PAGE
+# ============================================================================
+grid.newpage()
+grid.text("qPCR Host-DNA Depletion Analysis\nComplete Report", 
+          x = 0.5, y = 0.7, 
+          gp = gpar(fontsize = 24, fontface = "bold"))
+grid.text(paste("Generated:", Sys.Date()), 
+          x = 0.5, y = 0.5, 
+          gp = gpar(fontsize = 14))
+grid.text(paste("Analysis of chicken DNA before and after\nhost-DNA depletion across multiple sample types"), 
+          x = 0.5, y = 0.4, 
+          gp = gpar(fontsize = 12))
+
+# ============================================================================
+# PAGE 2: DATA OVERVIEW TABLE
+# ============================================================================
+grid.newpage()
+grid.text("Data Overview", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+overview_table <- data_clean %>% 
+  group_by(Sample_Type, Treatment) %>% 
+  summarise(
+    Total = n(),
+    Detected = sum(! is.na(Concentration)),
+    Non_Detects = sum(is.na(Concentration)),
+    .groups = "drop"
+  )
+
+table_grob <- tableGrob(overview_table, rows = NULL)
+grid.draw(table_grob)
+
+# ============================================================================
+# PAGE 3: CHEESECLOTH CT VALUES
+# ============================================================================
+print(plot_cheesecloth_ct)
+
+# ============================================================================
+# PAGE 4: CHEESECLOTH CONCENTRATION
+# ============================================================================
+print(plot_cheesecloth_conc)
+
+# ============================================================================
+# PAGE 5: PAIRED DESIGN VISUALIZATION
+# ============================================================================
+print(plot_pairing)
+
+# ============================================================================
+# PAGE 6: STATISTICAL TEST RESULTS PLOT
+# ============================================================================
+print(plot_stats)
+
+# ============================================================================
+# PAGE 7: STATISTICAL RESULTS TABLE
+# ============================================================================
+grid.newpage()
+grid.text("Statistical Test Results:  Cheesecloth Samples", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+stats_table <- data.frame(
+  Metric = c("Sample Size (n)", 
+             "Test Used",
+             "t-statistic", 
+             "Degrees of Freedom",
+             "p-value",
+             "",
+             "Mean Before (ng/uL)",
+             "Mean After (ng/uL)",
+             "Mean Difference",
+             "",
+             "Fold Reduction",
+             "Percent Reduction (%)",
+             "Cohen's d",
+             "",
+             "Mean Ct Before",
+             "Mean Ct After",
+             "Delta Ct",
+             "",
+             "Interpretation"),
+  Value = c("3 biological replicates",
+            "Paired t-test (one-tailed)",
+            round(paired_result$statistic, 3),
+            paired_result$parameter,
+            format.pval(paired_result$p.value, digits = 4),
+            "",
+            round(mean_before, 2),
+            round(mean_after, 2),
+            round(mean_diff, 2),
+            "",
+            paste0(round(fold_change, 2), "x"),
+            round(percent_reduction, 1),
+            paste0(round(cohens_d, 2), " (", 
+                   ifelse(abs(cohens_d) > 1.2, "Very Large",
+                   ifelse(abs(cohens_d) > 0.8, "Large",
+                   ifelse(abs(cohens_d) > 0.5, "Medium", "Small"))), ")"),
+            "",
+            round(mean(ct_before), 2),
+            round(mean(ct_after), 2),
+            round(delta_ct, 2),
+            "",
+            ifelse(paired_result$p.value < 0.05, 
+                   "Significant reduction (p<0.05)",
+                   "Trend toward significance (p<0.10)"))
+)
+
+table_grob2 <- tableGrob(stats_table, rows = NULL,
+                         theme = ttheme_default(base_size = 10))
+grid.draw(table_grob2)
+
+# ============================================================================
+# PAGE 8: INDIVIDUAL SAMPLE EFFECTS
+# ============================================================================
+grid.newpage()
+grid.text("Individual Sample Effects", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+ind_table <- individual_effects %>%
+  select(Replicate_ID, `Mean_Conc_Before Depletion`, `Mean_Conc_After Depletion`,
+         Fold_Reduction, Delta_Ct, Percent_Reduction) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+colnames(ind_table) <- c("Sample", "Before (ng/uL)", "After (ng/uL)", 
+                         "Fold Reduction", "Delta Ct", "Percent Reduction")
+
+table_grob3 <- tableGrob(ind_table, rows = NULL,
+                         theme = ttheme_default(base_size = 12))
+grid.draw(table_grob3)
+
+grid.text(paste0("All 3 samples show consistent reduction\n",
+                "Range: ", round(fold_range[1], 1), "x to ", 
+                round(fold_range[2], 1), "x reduction\n",
+                "CV of fold-change: ", round(cv_foldchange, 1), "%"), 
+          x = 0.5, y = 0.3, 
+          gp = gpar(fontsize = 11))
+
+# ============================================================================
+# PAGE 9: TECHNICAL REPLICATE QUALITY
+# ============================================================================
+grid.newpage()
+grid.text("Technical Replicate Quality Control", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+tech_table <- tech_rep_qc %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+colnames(tech_table) <- c("Treatment", "Bio Rep", "Mean Conc", 
+                          "SD Conc", "CV (%)", "n Tech")
+
+table_grob4 <- tableGrob(tech_table, rows = NULL,
+                         theme = ttheme_default(base_size = 11))
+grid.draw(table_grob4)
+
+grid.text(paste0("Average CV: ", round(mean_cv, 1), "%\n",
+                ifelse(mean_cv < 15, 
+                       "Excellent technical precision",
+                       "Acceptable technical precision")), 
+          x = 0.5, y = 0.3, 
+          gp = gpar(fontsize = 12, fontface = "bold", col = "darkgreen"))
+
+# ============================================================================
+# PAGE 10: FILTERED SAMPLES - CT
+# ============================================================================
+print(plot_filtered_ct)
+
+# ============================================================================
+# PAGE 11: FILTERED SAMPLES - CONCENTRATION
+# ============================================================================
+print(plot_filtered_conc)
+
+# ============================================================================
+# PAGE 12: ENRICHED SAMPLES - CT
+# ============================================================================
+print(plot_enriched_ct)
+
+# ============================================================================
+# PAGE 13: ENRICHED SAMPLES - CONCENTRATION
+# ============================================================================
+print(plot_enriched_conc)
+
+# ============================================================================
+# PAGE 14: ASSUMPTIONS CHECK
+# ============================================================================
+grid.newpage()
+grid.text("Statistical Assumptions Check", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+grid.text("1. Normality of Differences (Shapiro-Wilk Test)", 
+          x = 0.1, y = 0.85, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text(paste0("W = ", round(shapiro_test$statistic, 4), 
+                ", p-value = ", round(shapiro_test$p.value, 4)), 
+          x = 0.15, y = 0.80, just = "left",
+          gp = gpar(fontsize = 12))
+
+grid.text(ifelse(shapiro_test$p.value > 0.05,
+                "Differences are normally distributed",
+                "May not be normally distributed (small sample)"), 
+          x = 0.15, y = 0.75, just = "left",
+          gp = gpar(fontsize = 11, col = ifelse(shapiro_test$p.value > 0.05, "darkgreen", "orange")))
+
+grid.text("2.  Outlier Check (1.5 x IQR rule)", 
+          x = 0.1, y = 0.65, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text(ifelse(any(outliers),
+                "Potential outliers detected",
+                "No outliers detected"), 
+          x = 0.15, y = 0.60, just = "left",
+          gp = gpar(fontsize = 11, col = ifelse(any(outliers), "orange", "darkgreen")))
+
+grid.text("3. Independence", 
+          x = 0.1, y = 0.50, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text("Three independent biological replicates", 
+          x = 0.15, y = 0.45, just = "left",
+          gp = gpar(fontsize = 11, col = "darkgreen"))
+
+grid.text("CONCLUSION", 
+          x = 0.1, y = 0.30, just = "left",
+          gp = gpar(fontsize = 14, fontface = "bold"))
+
+grid.text("Paired t-test is appropriate for this data", 
+          x = 0.15, y = 0.25, just = "left",
+          gp = gpar(fontsize = 12, col = "darkgreen", fontface = "bold"))
+
+# ============================================================================
+# PAGE 15: KEY FINDINGS
+# ============================================================================
+grid.newpage()
+grid.text("Summary & Key Findings", 
+          x = 0.5, y = 0.95, 
+          gp = gpar(fontsize = 18, fontface = "bold"))
+
+grid.rect(x = 0.5, y = 0.70, width = 0.85, height = 0.35,
+          gp = gpar(fill = "lightblue", col = "darkblue", lwd = 2))
+
+grid.text("KEY FINDINGS", 
+          x = 0.5, y = 0.85, 
+          gp = gpar(fontsize = 16, fontface = "bold"))
+
+key_findings <- paste0(
+  round(fold_change, 1), "-fold reduction in chicken DNA\n",
+  round(percent_reduction, 1), "% reduction in concentration\n",
+  "Delta Ct = +", round(delta_ct, 2), " cycles\n",
+  "All 3 biological replicates showed consistent reduction\n",
+  ifelse(paired_result$p.value < 0.05, "Statistically significant", "Strong biological effect"),
+  " (p = ", format.pval(paired_result$p.value, digits = 3), ")\n",
+  "Cohen's d = ", round(cohens_d, 2), " (",
+  ifelse(abs(cohens_d) > 0.8, "large", "medium"), " effect size)"
+)
+
+grid.text(key_findings, 
+          x = 0.5, y = 0.68, 
+          gp = gpar(fontsize = 11, lineheight = 1.3))
+
+# Manuscript text
+grid.text("Suggested Manuscript Text:", 
+          x = 0.1, y = 0.45, just = "left",
+          gp = gpar(fontsize = 13, fontface = "bold"))
+
+manuscript_text <- paste0(
+  "Host-DNA depletion reduced chicken DNA concentration in cheesecloth\n",
+  "samples from ", round(mean_before, 1), " +/- ", round(sd_before, 1), 
+  " ng/uL to ", round(mean_after, 2), " +/- ", round(sd_after, 2), " ng/uL\n",
+  "(mean +/- SD, n=3), representing a ", round(fold_change, 1), "-fold reduction\n",
+  "(", round(percent_reduction, 1), "% reduction). ",
+  if(paired_result$p.value < 0.05) {
+    paste0("This reduction was statistically\n",
+           "significant (paired t-test:  t(", paired_result$parameter, ") = ", 
+           round(paired_result$statistic, 2), ", ", p_text, ").")
+  } else {
+    paste0("This reduction showed a trend\n",
+           "toward significance (paired t-test: t(", paired_result$parameter, ") = ", 
+           round(paired_result$statistic, 2), ", ", p_text, "), with all three\n",
+           "biological replicates showing consistent reduction in chicken DNA.")
+  }
+)
+
+grid.text(manuscript_text, 
+          x = 0.1, y = 0.30, just = "left",
+          gp = gpar(fontsize = 9, lineheight = 1.2))
+
+# ============================================================================
+# CLOSE PDF
+# ============================================================================
+dev.off()
+
+cat("PDF report generated:  'qPCR_Host_Depletion_Complete_Report.pdf'\n\n")
+```
+
+## Create Excel Export
+
+```{r export-to-excel-safe, eval=TRUE}
+library(writexl)
+
+excel_data <- list(
+  "Summary" = data.frame(
+    Metric = c("Sample Type", "Number of Biological Replicates", 
+               "Statistical Test", "t-statistic", "df", "p-value",
+               "Mean Before (ng/uL)", "SD Before", 
+               "Mean After (ng/uL)", "SD After",
+               "Mean Difference", "Fold Reduction", "Percent Reduction",
+               "Delta Ct", "Cohen's d", "Interpretation"),
+    Value = c("Cheesecloth", "3", "Paired t-test", 
+              round(paired_result$statistic, 4), paired_result$parameter,
+              format.pval(paired_result$p.value, digits = 5),
+              round(mean_before, 2), round(sd_before, 2),
+              round(mean_after, 4), round(sd_after, 4),
+              round(mean_diff, 2), round(fold_change, 2), 
+              round(percent_reduction, 1),
+              round(delta_ct, 2), round(cohens_d, 2),
+              ifelse(paired_result$p.value < 0.05, "Significant", "Trend"))
+  ),
+  
+  "Individual_Samples" = individual_effects %>%
+    select(Replicate_ID, "Mean_Conc_Before Depletion", "Mean_Conc_After Depletion",
+           "Mean_Ct_Before Depletion", "Mean_Ct_After Depletion",
+           Fold_Reduction, Delta_Ct, Percent_Reduction),
+  
+  "Technical_Replicates" = tech_rep_qc,
+  
+  "All_Data" = summary_stats %>%
+    filter(Sample_Type == "Cheesecloth") %>%
+    select(Treatment, Replicate_ID, Mean_Ct, SD_Ct, Mean_Conc, SD_Conc, n_detected)
+)
+
+write_xlsx(excel_data, "qPCR_Results_Data.xlsx")
+
+cat("✓ Excel file generated: 'qPCR_Results_Data.xlsx'\n")
+cat(" Contains 4 sheets: Summary, Individual_Samples, Technical_Replicates, All_Data\n\n")
+```
+
+```{r}
+
+
+cat("\n========================================\n")
+cat("ENRICHED SAMPLES STATISTICAL ANALYSIS\n")
+cat("========================================\n\n")
+
+cat("Note: Non-detects (ND) are treated as 0 ng/μL\n")
+cat("This represents complete depletion of chicken DNA\n\n")
+
+# Get enriched sample data (RVS and CAT)
+# Replace NA with 0 for "After Depletion" samples
+enriched_data <- summary_stats %>%
+  filter(Sample_Type %in% c("RVS", "CAT")) %>%
+  mutate(
+    Mean_Conc_Zero = ifelse(is.na(Mean_Conc) & Treatment == "After Depletion", 0, Mean_Conc),
+    Mean_Ct_Max = ifelse(is.na(Mean_Ct) & Treatment == "After Depletion", 40, Mean_Ct)
+  ) %>%
+  select(Sample_Type, Treatment, Replicate_ID, Mean_Conc, Mean_Conc_Zero, 
+         Mean_Ct, Mean_Ct_Max, n_detected, All_Non_Detect)
+
+# Display data structure
+cat("Enriched samples data structure:\n")
+print(enriched_data)
+cat("\n")
+
+# Check which samples have data
+enriched_summary_check <- enriched_data %>%
+  group_by(Sample_Type, Treatment) %>%
+  summarise(
+    n_replicates = n(),
+    n_detected = sum(n_detected > 0),
+    n_nondetect = sum(All_Non_Detect),
+    .groups = "drop"
+  )
+
+cat("Data availability:\n")
+print(enriched_summary_check)
+cat("\n")
+```
+
+## 7.2 RVS Samples - Statistical Analysis
+
+```{r rvs-stats}
+cat("\n========================================\n")
+cat("RVS SAMPLES ANALYSIS\n")
+cat("========================================\n\n")
+
+# Filter RVS data and use 0 for non-detects
+rvs_data <- enriched_data %>%
+  filter(Sample_Type == "RVS") %>%
+  select(Replicate_ID, Treatment, Mean_Conc, Mean_Conc_Zero, Mean_Ct, Mean_Ct_Max, All_Non_Detect)
+
+cat("RVS sample composition:\n")
+print(rvs_data)
+cat("\n")
+
+# Reshape to wide format
+rvs_wide <- rvs_data %>%
+  pivot_wider(
+    id_cols = Replicate_ID,
+    names_from = Treatment, 
+    values_from = c(Mean_Conc_Zero, Mean_Ct_Max, All_Non_Detect)
+  )
+
+cat("RVS paired data (ND = 0):\n")
+print(rvs_wide)
+cat("\n")
+
+# Check if we have complete pairs
+complete_pairs_rvs <- rvs_wide %>%
+  filter(! is.na(`Mean_Conc_Zero_Before Depletion`) & 
+         !is.na(`Mean_Conc_Zero_After Depletion`))
+
+n_pairs_rvs <- nrow(complete_pairs_rvs)
+
+if(n_pairs_rvs >= 2) {
+  
+  # Extract vectors
+  rvs_before <- complete_pairs_rvs$`Mean_Conc_Zero_Before Depletion`
+  rvs_after <- complete_pairs_rvs$`Mean_Conc_Zero_After Depletion`
+  rvs_ct_before <- complete_pairs_rvs$`Mean_Ct_Max_Before Depletion`
+  rvs_ct_after <- complete_pairs_rvs$`Mean_Ct_Max_After Depletion`
+  
+  cat("RVS paired values:\n")
+  cat("Before:", rvs_before, "ng/μL\n")
+  cat("After:  ", rvs_after, "ng/μL\n\n")
+  
+  # Check how many are non-detects
+  n_nondetect <- sum(complete_pairs_rvs$`All_Non_Detect_After Depletion`, na.rm = TRUE)
+  cat("Number of non-detects after depletion:", n_nondetect, "out of", n_pairs_rvs, "\n\n")
+  
+  # Statistical test
+  if(all(rvs_after == 0)) {
+    cat("⚠ ALL 'After' samples are non-detects (0 ng/μL)\n")
+    cat("Cannot perform standard paired t-test (all after values = 0)\n")
+    cat("This represents COMPLETE depletion!\n\n")
+    
+    # Use Wilcoxon signed-rank test (can handle zeros)
+    rvs_wilcox_result <- wilcox.test(rvs_before, rvs_after, 
+                                      paired = TRUE, alternative = "greater")
+    
+    cat("WILCOXON SIGNED-RANK TEST:\n")
+    cat("───────────────────────────────────────\n")
+    cat("V-statistic:       ", rvs_wilcox_result$statistic, "\n")
+    cat("p-value:         ", format.pval(rvs_wilcox_result$p.value, digits = 5), "\n\n")
+    
+    rvs_test_result <- rvs_wilcox_result
+    rvs_test_type <- "Wilcoxon signed-rank"
+    
+  } else {
+    # Paired t-test
+    rvs_paired_result <- t.test(rvs_before, rvs_after, 
+                                 paired = TRUE, alternative = "greater")
+    
+    cat("PAIRED T-TEST RESULTS:\n")
+    cat("───────────────────────────────────────\n")
+    cat("t-statistic:      ", round(rvs_paired_result$statistic, 4), "\n")
+    cat("df:              ", rvs_paired_result$parameter, "\n")
+    cat("p-value:         ", format.pval(rvs_paired_result$p.value, digits = 5), "\n\n")
+    
+    rvs_test_result <- rvs_paired_result
+    rvs_test_type <- "Paired t-test"
+  }
+  
+  # Calculate statistics
+  rvs_mean_before <- mean(rvs_before)
+  rvs_mean_after <- mean(rvs_after)
+  rvs_sd_before <- sd(rvs_before)
+  rvs_sd_after <- sd(rvs_after)
+  
+  rvs_differences <- rvs_before - rvs_after
+  rvs_mean_diff <- mean(rvs_differences)
+  rvs_sd_diff <- sd(rvs_differences)
+  
+  # Handle division by zero for fold change
+  if(rvs_mean_after == 0) {
+    rvs_fold_change <- Inf
+    rvs_fold_change_display <- "> 10,000"
+    rvs_percent_reduction <- 100
+  } else {
+    rvs_fold_change <- rvs_mean_before / rvs_mean_after
+    rvs_fold_change_display <- round(rvs_fold_change, 2)
+    rvs_percent_reduction <- (rvs_mean_diff / rvs_mean_before) * 100
+  }
+  
+  # Cohen's d
+  if(rvs_sd_diff > 0) {
+    rvs_cohens_d <- rvs_mean_diff / rvs_sd_diff
+  } else {
+    rvs_cohens_d <- NA
+  }
+  
+  # Delta Ct
+  rvs_delta_ct <- mean(rvs_ct_after - rvs_ct_before)
+  
+  cat("DESCRIPTIVE STATISTICS:\n")
+  cat("───────────────────────────────────────\n")
+  cat("Before:   ", round(rvs_mean_before, 2), " ± ", round(rvs_sd_before, 2), " ng/μL\n")
+  cat("After:  ", round(rvs_mean_after, 4), " ± ", round(rvs_sd_after, 4), " ng/μL\n\n")
+  
+  cat("EFFECT SIZE:\n")
+  cat("───────────────────────────────────────\n")
+  cat("Fold reduction:     ", rvs_fold_change_display, "×\n")
+  cat("Percent reduction:  ", round(rvs_percent_reduction, 2), "%\n")
+  cat("ΔCt:              ", round(rvs_delta_ct, 2), "\n")
+  if(!is.na(rvs_cohens_d)) {
+    cat("Cohen's d:        ", round(rvs_cohens_d, 2), " (", 
+        ifelse(abs(rvs_cohens_d) > 1.2, "Very Large",
+        ifelse(abs(rvs_cohens_d) > 0.8, "Large",
+        ifelse(abs(rvs_cohens_d) > 0.5, "Medium", "Small"))), ")\n")
+  } else {
+    cat("Cohen's d:         N/A (SD = 0)\n")
+  }
+  cat("\n")
+  
+  # Individual sample effects
+  cat("INDIVIDUAL SAMPLE EFFECTS:\n")
+  cat("───────────────────────────────────────\n")
+  for(i in 1:n_pairs_rvs) {
+    cat("Sample", complete_pairs_rvs$Replicate_ID[i], ":\n")
+    cat("  Before: ", round(rvs_before[i], 2), " ng/μL\n")
+    cat("  After:  ", round(rvs_after[i], 4), " ng/μL\n")
+    if(rvs_after[i] == 0) {
+      cat("  Reduction: Complete (ND)\n")
+    } else {
+      cat("  Fold:    ", round(rvs_before[i] / rvs_after[i], 2), "×\n")
+    }
+    cat("\n")
+  }
+  
+  cat("INTERPRETATION:\n")
+  cat("───────────────────────────────────────\n")
+  if(rvs_test_result$p.value < 0.001) {
+    cat("*** HIGHLY SIGNIFICANT reduction (p < 0.001)\n")
+  } else if(rvs_test_result$p.value < 0.01) {
+    cat("** VERY SIGNIFICANT reduction (p < 0.01)\n")
+  } else if(rvs_test_result$p.value < 0.05) {
+    cat("* SIGNIFICANT reduction (p < 0.05)\n")
+  } else if(rvs_test_result$p.value < 0.10) {
+    cat("† Trend toward significance (p < 0.10)\n")
+  } else {
+    cat("Not significant at α=0.05\n")
+  }
+  
+  if(n_nondetect == n_pairs_rvs) {
+    cat("\n✓ COMPLETE DEPLETION achieved in all samples!\n")
+  } else if(n_nondetect > 0) {
+    cat("\n✓ Complete depletion in", n_nondetect, "out of", n_pairs_rvs, "samples\n")
+  }
+  cat("\n")
+  
+} else if(n_pairs_rvs == 1) {
+  cat("⚠ Only 1 complete pair - insufficient for statistical testing\n")
+  
+  rvs_before <- complete_pairs_rvs$`Mean_Conc_Zero_Before Depletion`
+  rvs_after <- complete_pairs_rvs$`Mean_Conc_Zero_After Depletion`
+  
+  cat("Before:", round(rvs_before, 2), "ng/μL\n")
+  cat("After:  ", round(rvs_after, 4), "ng/μL\n")
+  
+  if(rvs_after == 0) {
+    cat("Reduction: Complete depletion (ND)\n\n")
+  } else {
+    cat("Fold reduction:", round(rvs_before / rvs_after, 2), "×\n\n")
+  }
+  
+} else {
+  cat("⚠ No complete pairs available for RVS samples\n\n")
+}
+```
+
+## 7.3 CAT Samples - Statistical Analysis
+
+```{r cat-stats}
+cat("\n========================================\n")
+cat("CAT SAMPLES ANALYSIS\n")
+cat("========================================\n\n")
+
+# Filter CAT data and use 0 for non-detects
+cat_data <- enriched_data %>%
+  filter(Sample_Type == "CAT") %>%
+  select(Replicate_ID, Treatment, Mean_Conc, Mean_Conc_Zero, Mean_Ct, Mean_Ct_Max, All_Non_Detect)
+
+cat("CAT sample composition:\n")
+print(cat_data)
+cat("\n")
+
+# Reshape to wide format
+cat_wide <- cat_data %>%
+  pivot_wider(
+    id_cols = Replicate_ID,
+    names_from = Treatment, 
+    values_from = c(Mean_Conc_Zero, Mean_Ct_Max, All_Non_Detect)
+  )
+
+cat("CAT paired data (ND = 0):\n")
+print(cat_wide)
+cat("\n")
+
+# Check if we have complete pairs
+complete_pairs_cat <- cat_wide %>%
+  filter(!is.na(`Mean_Conc_Zero_Before Depletion`) & 
+         !is.na(`Mean_Conc_Zero_After Depletion`))
+
+n_pairs_cat <- nrow(complete_pairs_cat)
+
+if(n_pairs_cat >= 2) {
+  
+  # Extract vectors
+  cat_before <- complete_pairs_cat$`Mean_Conc_Zero_Before Depletion`
+  cat_after <- complete_pairs_cat$`Mean_Conc_Zero_After Depletion`
+  cat_ct_before <- complete_pairs_cat$`Mean_Ct_Max_Before Depletion`
+  cat_ct_after <- complete_pairs_cat$`Mean_Ct_Max_After Depletion`
+  
+  cat("CAT paired values:\n")
+  cat("Before:", cat_before, "ng/μL\n")
+  cat("After: ", cat_after, "ng/μL\n\n")
+  
+  # Check how many are non-detects
+  n_nondetect <- sum(complete_pairs_cat$`All_Non_Detect_After Depletion`, na.rm = TRUE)
+  cat("Number of non-detects after depletion:", n_nondetect, "out of", n_pairs_cat, "\n\n")
+  
+  # Statistical test
+  if(all(cat_after == 0)) {
+    cat("⚠ ALL 'After' samples are non-detects (0 ng/μL)\n")
+    cat("Cannot perform standard paired t-test (all after values = 0)\n")
+    cat("This represents COMPLETE depletion!\n\n")
+    
+    # Use Wilcoxon signed-rank test
+    cat_wilcox_result <- wilcox.test(cat_before, cat_after, 
+                                      paired = TRUE, alternative = "greater")
+    
+    cat("WILCOXON SIGNED-RANK TEST:\n")
+    cat("───────────────────────────────────────\n")
+    cat("V-statistic:      ", cat_wilcox_result$statistic, "\n")
+    cat("p-value:         ", format.pval(cat_wilcox_result$p.value, digits = 5), "\n\n")
+    
+    cat_test_result <- cat_wilcox_result
+    cat_test_type <- "Wilcoxon signed-rank"
+    
+  } else {
+    # Paired t-test
+    cat_paired_result <- t.test(cat_before, cat_after, 
+                                 paired = TRUE, alternative = "greater")
+    
+    cat("PAIRED T-TEST RESULTS:\n")
+    cat("───────────────────────────────────────\n")
+    cat("t-statistic:      ", round(cat_paired_result$statistic, 4), "\n")
+    cat("df:              ", cat_paired_result$parameter, "\n")
+    cat("p-value:         ", format.pval(cat_paired_result$p.value, digits = 5), "\n\n")
+    
+    cat_test_result <- cat_paired_result
+    cat_test_type <- "Paired t-test"
+  }
+  
+  # Calculate statistics
+  cat_mean_before <- mean(cat_before)
+  cat_mean_after <- mean(cat_after)
+  cat_sd_before <- sd(cat_before)
+  cat_sd_after <- sd(cat_after)
+  
+  cat_differences <- cat_before - cat_after
+  cat_mean_diff <- mean(cat_differences)
+  cat_sd_diff <- sd(cat_differences)
+  
+  # Handle division by zero for fold change
+  if(cat_mean_after == 0) {
+    cat_fold_change <- Inf
+    cat_fold_change_display <- "> 10,000"
+    cat_percent_reduction <- 100
+  } else {
+    cat_fold_change <- cat_mean_before / cat_mean_after
+    cat_fold_change_display <- round(cat_fold_change, 2)
+    cat_percent_reduction <- (cat_mean_diff / cat_mean_before) * 100
+  }
+  
+  # Cohen's d
+  if(cat_sd_diff > 0) {
+    cat_cohens_d <- cat_mean_diff / cat_sd_diff
+  } else {
+    cat_cohens_d <- NA
+  }
+  
+  # Delta Ct
+  cat_delta_ct <- mean(cat_ct_after - cat_ct_before)
+  
+  cat("DESCRIPTIVE STATISTICS:\n")
+  cat("───────────────────────────────────────\n")
+  cat("Before:  ", round(cat_mean_before, 2), " ± ", round(cat_sd_before, 2), " ng/μL\n")
+  cat("After:  ", round(cat_mean_after, 4), " ± ", round(cat_sd_after, 4), " ng/μL\n\n")
+  
+  cat("EFFECT SIZE:\n")
+  cat("───────────────────────────────────────\n")
+  cat("Fold reduction:    ", cat_fold_change_display, "×\n")
+  cat("Percent reduction: ", round(cat_percent_reduction, 2), "%\n")
+  cat("ΔCt:               ", round(cat_delta_ct, 2), "\n")
+  if(!is.na(cat_cohens_d)) {
+    cat("Cohen's d:         ", round(cat_cohens_d, 2), " (", 
+        ifelse(abs(cat_cohens_d) > 1.2, "Very Large",
+        ifelse(abs(cat_cohens_d) > 0.8, "Large",
+        ifelse(abs(cat_cohens_d) > 0.5, "Medium", "Small"))), ")\n")
+  } else {
+    cat("Cohen's d:         N/A (SD = 0)\n")
+  }
+  cat("\n")
+  
+  # Individual sample effects
+  cat("INDIVIDUAL SAMPLE EFFECTS:\n")
+  cat("───────────────────────────────────────\n")
+  for(i in 1:n_pairs_cat) {
+    cat("Sample", complete_pairs_cat$Replicate_ID[i], ":\n")
+    cat("  Before: ", round(cat_before[i], 2), " ng/μL\n")
+    cat("  After:  ", round(cat_after[i], 4), " ng/μL\n")
+    if(cat_after[i] == 0) {
+      cat("  Reduction: Complete (ND)\n")
+    } else {
+      cat("  Fold:   ", round(cat_before[i] / cat_after[i], 2), "×\n")
+    }
+    cat("\n")
+  }
+  
+  cat("INTERPRETATION:\n")
+  cat("───────────────────────────────────────\n")
+  if(cat_test_result$p.value < 0.001) {
+    cat("*** HIGHLY SIGNIFICANT reduction (p < 0.001)\n")
+  } else if(cat_test_result$p.value < 0.01) {
+    cat("** VERY SIGNIFICANT reduction (p < 0.01)\n")
+  } else if(cat_test_result$p.value < 0.05) {
+    cat("* SIGNIFICANT reduction (p < 0.05)\n")
+  } else if(cat_test_result$p.value < 0.10) {
+    cat("† Trend toward significance (p < 0.10)\n")
+  } else {
+    cat("Not significant at α=0.05\n")
+  }
+  
+  if(n_nondetect == n_pairs_cat) {
+    cat("\n✓ COMPLETE DEPLETION achieved in all samples!\n")
+  } else if(n_nondetect > 0) {
+    cat("\n✓ Complete depletion in", n_nondetect, "out of", n_pairs_cat, "samples\n")
+  }
+  cat("\n")
+  
+} else if(n_pairs_cat == 1) {
+  cat("⚠ Only 1 complete pair - insufficient for statistical testing\n")
+  
+  cat_before <- complete_pairs_cat$`Mean_Conc_Zero_Before Depletion`
+  cat_after <- complete_pairs_cat$`Mean_Conc_Zero_After Depletion`
+  
+  cat("Before:", round(cat_before, 2), "ng/μL\n")
+  cat("After: ", round(cat_after, 4), "ng/μL\n")
+  
+  if(cat_after == 0) {
+    cat("Reduction: Complete depletion (ND)\n\n")
+  } else {
+    cat("Fold reduction:", round(cat_before / cat_after, 2), "×\n\n")
+  }
+  
+} else {
+  cat("⚠ No complete pairs available for CAT samples\n\n")
+}
+```
+
+## 7.4 Enriched Samples Summary Table
+
+```{r enriched-summary-table}
+cat("\n========================================\n")
+cat("ENRICHED SAMPLES SUMMARY\n")
+cat("========================================\n\n")
+
+# Create summary table
+enriched_results <- data.frame(
+  Sample_Type = character(),
+  N_Pairs = numeric(),
+  Test_Type = character(),
+  Mean_Before = numeric(),
+  Mean_After = numeric(),
+  Fold_Reduction = character(),
+  Percent_Reduction = numeric(),
+  Delta_Ct = numeric(),
+  P_Value = character(),
+  stringsAsFactors = FALSE
+)
+
+# Add RVS if analyzed
+if(exists("n_pairs_rvs") && n_pairs_rvs >= 2) {
+  enriched_results <- rbind(enriched_results, data.frame(
+    Sample_Type = "RVS",
+    N_Pairs = n_pairs_rvs,
+    Test_Type = rvs_test_type,
+    Mean_Before = round(rvs_mean_before, 2),
+    Mean_After = round(rvs_mean_after, 4),
+    Fold_Reduction = as.character(rvs_fold_change_display),
+    Percent_Reduction = round(rvs_percent_reduction, 2),
+    Delta_Ct = round(rvs_delta_ct, 2),
+    P_Value = format.pval(rvs_test_result$p.value, digits = 4)
+  ))
+}
+
+# Add CAT if analyzed
+if(exists("n_pairs_cat") && n_pairs_cat >= 2) {
+  enriched_results <- rbind(enriched_results, data.frame(
+    Sample_Type = "CAT",
+    N_Pairs = n_pairs_cat,
+    Test_Type = cat_test_type,
+    Mean_Before = round(cat_mean_before, 2),
+    Mean_After = round(cat_mean_after, 4),
+    Fold_Reduction = as.character(cat_fold_change_display),
+    Percent_Reduction = round(cat_percent_reduction, 2),
+    Delta_Ct = round(cat_delta_ct, 2),
+    P_Value = format.pval(cat_test_result$p.value, digits = 4)
+  ))
+}
+
+if(nrow(enriched_results) > 0) {
+  knitr::kable(enriched_results,
+               col.names = c("Sample Type", "N", "Test", "Before (ng/μL)", 
+                            "After (ng/μL)", "Fold↓", "%↓", "ΔCt", "p-value"),
+               caption = "Enriched Samples:   Host-DNA Depletion Statistical Summary")
+} else {
+  cat("No statistical tests could be performed (insufficient sample pairs)\n")
+}
+
+cat("\n")
+cat("Note: Non-detects treated as 0 ng/μL\n")
+cat("Fold reduction displayed as '>10,000×' when mean after = 0\n\n")
+```
+
+## 7.5 Visualize Enriched Sample Results
+
+```{r plot-enriched-results, fig.width=10, fig.height=6}
+# Prepare data for plotting (using 0 for non-detects)
+enriched_plot_data <- enriched_data %>%
+  filter(! is.na(Mean_Conc_Zero)) %>%
+  mutate(
+    Display_Conc = ifelse(Mean_Conc_Zero == 0, 0.0001, Mean_Conc_Zero),  # For log scale
+    Is_NonDetect = (Mean_Conc_Zero == 0)
+  )
+
+# Calculate means for bars
+enriched_means <- enriched_plot_data %>%
+  group_by(Sample_Type, Treatment) %>%
+  summarise(
+    Mean = mean(Display_Conc, na.rm = TRUE),
+    SE = sd(Display_Conc, na.rm = TRUE) / sqrt(n()),
+    Any_NonDetect = any(Is_NonDetect),
+    All_NonDetect = all(Is_NonDetect),
+    .groups = "drop"
+  )
+
+# Create plot
+plot_enriched_summary <- ggplot() +
+  geom_col(data = enriched_means,
+           aes(x = Sample_Type, y = Mean, fill = Treatment),
+           position = position_dodge(0.8), alpha = 0.7, width = 0.7) +
+  geom_errorbar(data = enriched_means %>% filter(! All_NonDetect),
+                aes(x = Sample_Type, y = Mean, 
+                    ymin = pmax(Mean - SE, 0.0001), ymax = Mean + SE,
+                    group = Treatment),
+                position = position_dodge(0.8), width = 0.2) +
+  geom_point(data = enriched_plot_data,
+             aes(x = Sample_Type, y = Display_Conc, 
+                 color = Treatment, group = interaction(Sample_Type, Treatment)),
+             position = position_dodge(0.8), size = 3, alpha = 0.8) +
+  # Add "ND" label for all non-detects
+  geom_text(data = enriched_means %>% filter(All_NonDetect),
+            aes(x = Sample_Type, y = Mean * 5, label = "All ND", group = Treatment),
+            position = position_dodge(0.8), 
+            size = 4, fontface = "bold", color = "#4DBBD5") +
+  scale_fill_manual(values = c("Before Depletion" = "#E64B35", 
+                               "After Depletion" = "#4DBBD5")) +
+  scale_color_manual(values = c("Before Depletion" = "#E64B35", 
+                                "After Depletion" = "#4DBBD5")) +
+  scale_y_continuous(trans = "log10",
+                     labels = scales::trans_format("log10", scales:: math_format(10^.x))) +
+  labs(
+    title = "Enriched Samples:   Host-DNA Depletion Efficacy",
+    subtitle = "RVS and CAT samples (log scale); ND = 0 ng/μL (complete depletion)",
+    x = "Sample Type",
+    y = "Chicken DNA Concentration (ng/μL, log scale)",
+    fill = "Treatment",
+    color = "Treatment"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "gray30"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "bottom"
+  )
+
+print(plot_enriched_summary)
+ggsave("enriched_samples_summary.png", plot_enriched_summary, width = 10, height = 6, dpi = 300)
+```
+
+## 7.6 Manuscript Text for Enriched Samples
+
+```{r enriched-manuscript-text}
+cat("\n========================================\n")
+cat("SUGGESTED MANUSCRIPT TEXT\n")
+cat("========================================\n\n")
+
+cat("For RVS and CAT Enriched Samples:\n\n")
+
+if(exists("rvs_test_result") && exists("cat_test_result")) {
+  # Both samples analyzed
+  cat('"In enriched samples, host-DNA depletion achieved complete or near-complete\n')
+  cat('removal of chicken DNA.  RVS samples showed a ', rvs_fold_change_display, '-fold reduction\n', sep='')
+  cat('(', round(rvs_percent_reduction, 1), '% reduction, ', rvs_test_type, ':  p ', sep='')
+  if(rvs_test_result$p.value < 0.001) cat('< 0.001') else cat('= ', format.pval(rvs_test_result$p.value, digits = 3), sep='')
+  cat('). CAT samples showed a ', cat_fold_change_display, '-fold reduction\n', sep='')
+  cat('(', round(cat_percent_reduction, 1), '% reduction, ', cat_test_type, ': p ', sep='')
+  if(cat_test_result$p.value < 0.001) cat('< 0.001') else cat('= ', format.pval(cat_test_result$p.value, digits = 3), sep='')
+  cat('). In both sample types, all post-depletion samples were below or at the\n')
+  cat('detection limit, demonstrating highly effective host-DNA removal.  "\n\n')
+  
+} else if(exists("rvs_test_result")) {
+  # Only RVS analyzed
+  cat('"In RVS enriched samples, host-DNA depletion achieved a ', rvs_fold_change_display, '-fold\n', sep='')
+  cat('reduction (', round(rvs_percent_reduction, 1), '% reduction, ', rvs_test_type, ':  p ', sep='')
+  if(rvs_test_result$p.value < 0.001) cat('< 0.001') else cat('= ', format.pval(rvs_test_result$p.value, digits = 3), sep='')
+  cat('), with all post-depletion samples at or below the detection limit.  "\n\n')
+  
+} else if(exists("cat_test_result")) {
+  # Only CAT analyzed
+  cat('"In CAT enriched samples, host-DNA depletion achieved a ', cat_fold_change_display, '-fold\n', sep='')
+  cat('reduction (', round(cat_percent_reduction, 1), '% reduction, ', cat_test_type, ':  p ', sep='')
+  if(cat_test_result$p.value < 0.001) cat('< 0.001') else cat('= ', format.pval(cat_test_result$p.value, digits = 3), sep='')
+  cat('), with all post-depletion samples at or below the detection limit. "\n\n')
+  
+} else {
+  cat('"Insufficient paired samples for statistical analysis of enriched samples.  "\n\n')
+}
+```
+

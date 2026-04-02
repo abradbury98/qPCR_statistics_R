@@ -1,0 +1,741 @@
+---
+title: "qPCR Salmonella Host-DNA Depletion Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+```
+
+```{r load libraries}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(readr)
+library(patchwork)  # For combining plots
+library(gridExtra)
+library(grid)
+library(writexl)
+```
+
+# Import and organize data
+
+```{r load data}
+# Read the data
+data <- read_excel('/Volumes/Alice/1_METHOD_DEVELOPMENT/Host-DNA_depletion/qPCR_Salmonella_host-DNA_depletion/qPCR_Salmonella_host-DNA_depletion.xlsx')
+
+# View structure
+glimpse(data)
+```
+
+```{r clean data}
+# Set detection limits
+detection_limit_ct <- 40       # Standard qPCR detection limit
+detection_limit_conc <- 0.00001 # Very low concentration
+
+# Clean and structure the data
+data_clean <- data %>%
+  # Remove rows with all NA values
+  filter(!is.na(Name)) %>%
+  # FIRST: Rename "No. 3" samples to replicate 4 to match naming pattern
+  mutate(
+    Name = case_when(
+      str_detect(Name, "^No Host-DNA Depletion No\\. 3$") ~ "No Host-DNA Depletion 4",
+      str_detect(Name, "^Host-DNA Depletion No\\. 3$") ~ "Host-DNA Depletion 4",
+      TRUE ~ Name
+    )
+  ) %>%
+  # Extract sample information from Name column
+  mutate(
+    # Determine if host depletion was applied
+    Treatment = case_when(
+      str_detect(Name, "No Host") ~ "Before Depletion",
+      str_detect(Name, "Host") & !str_detect(Name, "No Host") ~ "After Depletion",
+      TRUE ~ "Unknown"
+    ),
+    Treatment = factor(Treatment, levels = c("Before Depletion", "After Depletion")),
+    # Extract sample type
+    Sample_Type = case_when(
+      str_detect(Name, "^RVS") ~ "RVS",
+      str_detect(Name, "^CAT") ~ "CAT",
+      str_detect(Name, "No Host-DNA Depletion No") ~ "Non-Enriched",
+      str_detect(Name, "Host-DNA Depletion No") ~ "Non-Enriched",
+      str_detect(Name, "No Host-DNA Depletion") ~ "Non-Enriched",
+      str_detect(Name, "Host-DNA Depletion") ~ "Non-Enriched",
+      TRUE ~ "Unknown"
+    ),
+    # Extract replicate number - now simplified since we renamed "No. 3" to "4"
+    Replicate_ID = case_when(
+      # For RVS and CAT, extract number after the sample type
+      str_detect(Name, "^RVS") ~ as.numeric(str_extract(Name, "(?<=RVS )\\d+")),
+      str_detect(Name, "^CAT") ~ as.numeric(str_extract(Name, "(?<=CAT )\\d+")),
+      # For non-enriched, extract the number at the end
+      str_detect(Name, "No Host-DNA Depletion \\d+$") ~ 
+        as.numeric(str_extract(Name, "\\d+$")),
+      str_detect(Name, "Host-DNA Depletion \\d+$") ~ 
+        as.numeric(str_extract(Name, "\\d+$")),
+      TRUE ~ NA_real_
+    ),
+    # Handle NEG values - treat as NA
+    Ct = ifelse(Ct == "NEG (NTC)" | is.na(Ct), NA, as.numeric(Ct)),
+    Concentration = ifelse(is.na(`Calc Conc (ng/ul)`) | `Calc Conc (ng/ul)` == "NEG", 
+                          NA, as.numeric(`Calc Conc (ng/ul)`)),
+    # Non-detects
+    Below_Detection = is.na(Ct) | is.na(Concentration)
+  ) %>%
+  select(Name, Treatment, Sample_Type, Replicate_ID, Ct, Concentration, Below_Detection)
+
+# Check the extraction worked properly
+cat("Non-Enriched sample names and Replicate IDs:\n")
+data_clean %>% 
+  filter(Sample_Type == "Non-Enriched") %>%
+  distinct(Name, Replicate_ID, Treatment) %>%
+  arrange(Replicate_ID, Treatment) %>%
+  print()
+
+cat("\n")
+
+# View cleaned data summary
+data_clean %>% 
+  group_by(Sample_Type, Treatment) %>% 
+  summarise(
+    Total_Measurements = n(),
+    Detected = sum(!is.na(Concentration)),
+    Non_Detects = sum(is.na(Concentration)),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Data Overview by Sample Type and Treatment")
+```
+
+```{r prepare summary stats}
+# Calculate summary statistics by biological replicate
+summary_stats <- data_clean %>%
+  group_by(Sample_Type, Treatment, Replicate_ID) %>%
+  summarise(
+    n_measurements = n(),
+    n_detected = sum(!Below_Detection),
+    n_non_detect = sum(Below_Detection),
+    All_Non_Detect = all(Below_Detection),
+    Mean_Ct = ifelse(all(is.na(Ct)), NA_real_, mean(Ct, na.rm = TRUE)),
+    SD_Ct = ifelse(all(is.na(Ct)), NA_real_, sd(Ct, na.rm = TRUE)),
+    SE_Ct = ifelse(all(is.na(Ct)), NA_real_, SD_Ct / sqrt(sum(!is.na(Ct)))),
+    Mean_Conc = ifelse(all(is.na(Concentration)), NA_real_, mean(Concentration, na.rm = TRUE)),
+    SD_Conc = ifelse(all(is.na(Concentration)), NA_real_, sd(Concentration, na.rm = TRUE)),
+    SE_Conc = ifelse(all(is.na(Concentration)), NA_real_, SD_Conc / sqrt(sum(!is.na(Concentration)))),
+    .groups = "drop"
+  )
+
+# Display summary table
+summary_stats %>%
+  select(Sample_Type, Treatment, Replicate_ID, n_detected, n_non_detect, 
+         All_Non_Detect, Mean_Ct, Mean_Conc) %>%
+  arrange(Sample_Type, Replicate_ID, Treatment) %>%
+  knitr::kable(digits = 4, caption = "Summary Statistics by Biological Replicate")
+```
+
+# Non-Enriched Samples - COMBINED PANEL PLOT
+
+```{r non-enriched combined panel plot}
+# Prepare non-enriched data for plotting
+non_enriched_data <- data_clean %>%
+  filter(Sample_Type == "Non-Enriched") %>%
+  mutate(
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(Concentration), detection_limit_conc, Concentration)
+  )
+
+# Define color palette (matching Campylobacter)
+color_palette <- c("1" = "#8DB38B", "2" = "#F29E4C", 
+                   "3" = "#6279B8", "4" = "#A54657")
+
+# Create long format data for faceting
+non_enriched_long <- non_enriched_data %>%
+  select(Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL)"))
+  )
+
+# Create the combined panel plot
+non_enriched_panel <- ggplot(non_enriched_long,
+                             aes(x = Treatment, y = Value,
+                                 color = as.factor(Replicate_ID),
+                                 group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 4, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(alpha = 0.5, 
+              width = 0.15, height = 0, size = 2.5) +
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y", strip.position = "left") +
+  scale_color_manual(values = color_palette,
+                     name = "Biological\nReplicate") +
+  labs(
+    title = expression(paste("Non-Enriched Samples: Host-DNA Depletion Effect on ", italic("Salmonella"))),
+    subtitle = "Each point = qPCR technical replicate | Lines connect mean ± SE",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "right"
+  )
+
+print(non_enriched_panel)
+ggsave("salmonella_non_enriched_combined_panels.png", non_enriched_panel,
+       width = 10, height = 10, dpi = 600)
+```
+
+# Statistical Analysis - Non-Enriched Samples
+
+```{r stats non-enriched}
+cat("\n========================================\n")
+cat("STATISTICAL ANALYSIS - NON-ENRICHED SALMONELLA\n")
+cat("========================================\n\n")
+
+# Prepare paired data
+non_enriched_paired <- summary_stats %>%
+  filter(Sample_Type == "Non-Enriched") %>%
+  select(Replicate_ID, Treatment, Mean_Ct, Mean_Conc, All_Non_Detect) %>%
+  pivot_wider(names_from = Treatment, 
+              values_from = c(Mean_Ct, Mean_Conc, All_Non_Detect))
+
+cat("Paired Data Structure:\n")
+print(non_enriched_paired)
+cat("\n")
+
+# Extract before/after vectors
+before_conc <- non_enriched_paired$`Mean_Conc_Before Depletion`
+after_conc <- non_enriched_paired$`Mean_Conc_After Depletion`
+before_ct <- non_enriched_paired$`Mean_Ct_Before Depletion`
+after_ct <- non_enriched_paired$`Mean_Ct_After Depletion`
+
+cat("Non-detection status:\n")
+for (i in 1:nrow(non_enriched_paired)) {
+  cat(sprintf("Replicate %d: Before = %s, After = %s\n",
+              non_enriched_paired$Replicate_ID[i],
+              ifelse(is.na(before_conc[i]), "ND", "detected"),
+              ifelse(is.na(after_conc[i]), "ND", "detected")))
+}
+cat("\n")
+
+# ============================================================================
+# APPROACH 1: EXCLUDE NON-DETECTS (Conservative)
+# ============================================================================
+cat("========================================\n")
+cat("APPROACH 1: Excluding Non-Detects\n")
+cat("========================================\n\n")
+
+complete_pairs <- !is.na(before_conc) & !is.na(after_conc)
+n_complete <- sum(complete_pairs)
+
+cat("Complete pairs (both detected):", n_complete, "\n\n")
+
+if (n_complete >= 2) {
+  before_complete <- before_conc[complete_pairs]
+  after_complete <- after_conc[complete_pairs]
+  
+  # Paired t-test
+  t_result <- t.test(before_complete, after_complete,
+                     paired = TRUE, alternative = "two.sided")
+  
+  cat("PAIRED T-TEST (excluding non-detects):\n")
+  cat("  n pairs:", n_complete, "\n")
+  cat("  Mean Before:", round(mean(before_complete), 4), "ng/μL\n")
+  cat("  Mean After:", round(mean(after_complete), 4), "ng/μL\n")
+  cat("  t-statistic:", round(t_result$statistic, 3), "\n")
+  cat("  df:", t_result$parameter, "\n")
+  cat("  p-value:", format.pval(t_result$p.value, digits = 4), "\n")
+  
+  if (t_result$p.value < 0.05) {
+    cat("  *** SIGNIFICANT (p < 0.05) ***\n")
+  } else if (t_result$p.value < 0.10) {
+    cat("  † Trend toward significance (p < 0.10)\n")
+  } else {
+    cat("  Not significant (p ≥ 0.10)\n")
+  }
+  
+  # Effect size
+  differences <- before_complete - after_complete
+  cohens_d <- mean(differences) / sd(differences)
+  fold_change <- mean(before_complete) / mean(after_complete)
+  percent_change <- (mean(differences) / mean(before_complete)) * 100
+  
+  cat("\nEFFECT SIZE:\n")
+  cat("  Fold change:", round(fold_change, 2), "×\n")
+  cat("  Percent change:", round(percent_change, 1), "%\n")
+  cat("  Cohen's d:", round(cohens_d, 2), "\n\n")
+  
+  # Wilcoxon test
+  w_result <- wilcox.test(before_complete, after_complete,
+                          paired = TRUE, alternative = "two.sided")
+  cat("WILCOXON SIGNED-RANK TEST:\n")
+  cat("  V-statistic:", w_result$statistic, "\n")
+  cat("  p-value:", format.pval(w_result$p.value, digits = 4), "\n\n")
+} else {
+  cat("Insufficient complete pairs for statistical testing.\n\n")
+}
+
+# ============================================================================
+# APPROACH 2: SIGN TEST
+# ============================================================================
+cat("========================================\n")
+cat("APPROACH 2: Sign Test\n")
+cat("========================================\n\n")
+
+changes <- rep(NA, length(before_conc))
+for (i in 1:length(before_conc)) {
+  if (!is.na(before_conc[i]) && !is.na(after_conc[i])) {
+    changes[i] <- ifelse(before_conc[i] > after_conc[i], "reduction", 
+                        ifelse(after_conc[i] > before_conc[i], "increase", "no change"))
+  } else if (!is.na(before_conc[i]) && is.na(after_conc[i])) {
+    changes[i] <- "reduction"
+  } else if (is.na(before_conc[i]) && !is.na(after_conc[i])) {
+    changes[i] <- "increase"
+  }
+}
+
+cat("Direction of change for each replicate:\n")
+for (i in 1:length(changes)) {
+  if (!is.na(changes[i])) {
+    cat(sprintf("  Replicate %d: %s\n", non_enriched_paired$Replicate_ID[i], changes[i]))
+  }
+}
+cat("\n")
+
+n_reductions <- sum(changes == "reduction", na.rm = TRUE)
+n_increases <- sum(changes == "increase", na.rm = TRUE)
+n_total <- n_reductions + n_increases
+
+if (n_total > 0) {
+  sign_test <- binom.test(n_reductions, n_total, p = 0.5, alternative = "two.sided")
+  cat("SIGN TEST RESULTS:\n")
+  cat("  Total pairs with change:", n_total, "\n")
+  cat("  Reductions:", n_reductions, "\n")
+  cat("  Increases:", n_increases, "\n")
+  cat("  p-value:", format.pval(sign_test$p.value, digits = 4), "\n\n")
+}
+
+cat("\n")
+```
+
+# RVS Samples - COMBINED PANEL PLOT
+
+```{r rvs combined panel plot}
+# Prepare RVS data for plotting
+rvs_data <- data_clean %>%
+  filter(Sample_Type == "RVS") %>%
+  mutate(
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(Concentration), detection_limit_conc, Concentration)
+  )
+
+# Define color palette (matching Campylobacter)
+color_palette2 <- c("1" = "#966B9D", "2" = "#2A7F62", 
+                    "3" = "#9CEAEF")
+
+# Create long format
+rvs_long <- rvs_data %>%
+  select(Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL)"))
+  )
+
+# Create plot
+rvs_panel <- ggplot(rvs_long,
+                    aes(x = Treatment, y = Value,
+                        color = as.factor(Replicate_ID),
+                        group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 4, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(aes(shape = Below_Detection), alpha = 0.5, 
+              width = 0.15, height = 0, size = 2.5) +
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y", strip.position = "left") +
+  scale_color_manual(values = color_palette2,
+                     name = "Biological\nReplicate") +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 4),
+                     labels = c("Detected", "Non-detect"),
+                     name = "Detection\nStatus") +
+  labs(
+    title = expression(paste("RVS Enriched Samples: Host-DNA Depletion Effect on ", italic("Salmonella"))),
+    subtitle = "Each point = qPCR technical replicate | × = Non-detect | Lines connect mean ± SE",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "right"
+  )
+
+print(rvs_panel)
+ggsave("salmonella_rvs_combined_panels.png", rvs_panel,
+       width = 10, height = 10, dpi = 600)
+```
+
+# Statistical Analysis - RVS Samples
+
+```{r stats rvs}
+cat("\n========================================\n")
+cat("STATISTICAL ANALYSIS - RVS SAMPLES\n")
+cat("========================================\n\n")
+
+# Prepare paired data
+rvs_paired <- summary_stats %>%
+  filter(Sample_Type == "RVS") %>%
+  select(Replicate_ID, Treatment, Mean_Ct, Mean_Conc, All_Non_Detect) %>%
+  pivot_wider(names_from = Treatment, 
+              values_from = c(Mean_Ct, Mean_Conc, All_Non_Detect))
+
+cat("RVS Paired Data:\n")
+print(rvs_paired)
+cat("\n")
+
+before_conc_rvs <- rvs_paired$`Mean_Conc_Before Depletion`
+after_conc_rvs <- rvs_paired$`Mean_Conc_After Depletion`
+
+# Filter complete pairs
+complete_pairs_rvs <- !is.na(before_conc_rvs) & !is.na(after_conc_rvs)
+n_complete_rvs <- sum(complete_pairs_rvs)
+
+if (n_complete_rvs >= 2) {
+  before_complete_rvs <- before_conc_rvs[complete_pairs_rvs]
+  after_complete_rvs <- after_conc_rvs[complete_pairs_rvs]
+  
+  # Choose appropriate test
+  if (all(after_complete_rvs == 0)) {
+    cat("All 'After' values are 0 (complete depletion)\n")
+    cat("Using Wilcoxon signed-rank test\n\n")
+    test_rvs <- wilcox.test(before_complete_rvs, after_complete_rvs,
+                            paired = TRUE, alternative = "greater")
+    test_type <- "Wilcoxon signed-rank"
+  } else {
+    cat("Using Paired t-test\n\n")
+    test_rvs <- t.test(before_complete_rvs, after_complete_rvs,
+                      paired = TRUE, alternative = "greater")
+    test_type <- "Paired t-test"
+  }
+  
+  cat("TEST RESULTS:\n")
+  cat("  Test:", test_type, "\n")
+  cat("  n pairs:", n_complete_rvs, "\n")
+  cat("  Mean Before:", round(mean(before_complete_rvs), 4), "ng/μL\n")
+  cat("  Mean After:", round(mean(after_complete_rvs), 6), "ng/μL\n")
+  cat("  p-value:", format.pval(test_rvs$p.value, digits = 4), "\n")
+  
+  if (test_rvs$p.value < 0.001) {
+    cat("  *** HIGHLY SIGNIFICANT (p < 0.001) ***\n")
+  } else if (test_rvs$p.value < 0.01) {
+    cat("  ** VERY SIGNIFICANT (p < 0.01) **\n")
+  } else if (test_rvs$p.value < 0.05) {
+    cat("  * SIGNIFICANT (p < 0.05) *\n")
+  } else {
+    cat("  Not significant\n")
+  }
+  
+  # Effect size
+  if (mean(after_complete_rvs) == 0) {
+    fold_change_rvs <- Inf
+    cat("\n  Fold reduction: Complete (>10,000×)\n")
+    cat("  Percent reduction: 100%\n")
+  } else {
+    fold_change_rvs <- mean(before_complete_rvs) / mean(after_complete_rvs)
+    percent_red_rvs <- ((mean(before_complete_rvs) - mean(after_complete_rvs)) / 
+                        mean(before_complete_rvs)) * 100
+    cat("\n  Fold reduction:", round(fold_change_rvs, 2), "×\n")
+    cat("  Percent reduction:", round(percent_red_rvs, 1), "%\n")
+  }
+} else {
+  cat("Insufficient complete pairs for RVS statistical testing.\n")
+}
+
+cat("\n")
+```
+
+# CAT Samples - COMBINED PANEL PLOT
+
+```{r cat combined panel plot}
+# Prepare CAT data for plotting
+cat_data <- data_clean %>%
+  filter(Sample_Type == "CAT") %>%
+  mutate(
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(Concentration), detection_limit_conc, Concentration)
+  )
+
+# Define color palette (matching Campylobacter)
+color_palette3 <- c("1" = "#F7934C", "2" = "#417A9F", 
+                    "3" = "#68274A")
+
+# Create long format
+cat_long <- cat_data %>%
+  select(Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL)"))
+  )
+
+# Create plot
+cat_panel <- ggplot(cat_long,
+                    aes(x = Treatment, y = Value,
+                        color = as.factor(Replicate_ID),
+                        group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 4, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(alpha = 0.5, 
+              width = 0.15, height = 0, size = 2.5) +
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y", strip.position = "left") +
+  scale_color_manual(values = color_palette3,
+                     name = "Biological\nReplicate") +
+  scale_y_continuous(n.breaks = 8) +
+  labs(
+    title = expression(paste("CAT Enriched Samples: Host-DNA Depletion Effect on ", italic("Salmonella"))),
+    subtitle = "Each point = qPCR technical replicate | Lines connect mean ± SE",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "right"
+  )
+
+print(cat_panel)
+ggsave("salmonella_cat_combined_panels.png", cat_panel,
+       width = 10, height = 10, dpi = 600)
+```
+
+# Statistical Analysis - CAT Samples
+
+```{r stats cat}
+cat("\n========================================\n")
+cat("STATISTICAL ANALYSIS - CAT SAMPLES\n")
+cat("========================================\n\n")
+
+# Prepare paired data
+cat_paired <- summary_stats %>%
+  filter(Sample_Type == "CAT") %>%
+  select(Replicate_ID, Treatment, Mean_Ct, Mean_Conc, All_Non_Detect) %>%
+  pivot_wider(names_from = Treatment, 
+              values_from = c(Mean_Ct, Mean_Conc, All_Non_Detect))
+
+cat("CAT Paired Data:\n")
+print(cat_paired)
+cat("\n")
+
+before_conc_cat <- cat_paired$`Mean_Conc_Before Depletion`
+after_conc_cat <- cat_paired$`Mean_Conc_After Depletion`
+
+# Filter complete pairs
+complete_pairs_cat <- !is.na(before_conc_cat) & !is.na(after_conc_cat)
+n_complete_cat <- sum(complete_pairs_cat)
+
+if (n_complete_cat >= 2) {
+  before_complete_cat <- before_conc_cat[complete_pairs_cat]
+  after_complete_cat <- after_conc_cat[complete_pairs_cat]
+  
+  # Paired t-test
+  cat("Using Paired t-test\n\n")
+  test_cat <- t.test(before_complete_cat, after_complete_cat,
+                    paired = TRUE, alternative = "greater")
+  
+  cat("TEST RESULTS:\n")
+  cat("  Test: Paired t-test\n")
+  cat("  n pairs:", n_complete_cat, "\n")
+  cat("  Mean Before:", round(mean(before_complete_cat), 4), "ng/μL\n")
+  cat("  Mean After:", round(mean(after_complete_cat), 4), "ng/μL\n")
+  cat("  t-statistic:", round(test_cat$statistic, 3), "\n")
+  cat("  p-value:", format.pval(test_cat$p.value, digits = 4), "\n")
+  
+  if (test_cat$p.value < 0.001) {
+    cat("  *** HIGHLY SIGNIFICANT (p < 0.001) ***\n")
+  } else if (test_cat$p.value < 0.01) {
+    cat("  ** VERY SIGNIFICANT (p < 0.01) **\n")
+  } else if (test_cat$p.value < 0.05) {
+    cat("  * SIGNIFICANT (p < 0.05) *\n")
+  } else {
+    cat("  Not significant\n")
+  }
+  
+  # Effect size
+  fold_change_cat <- mean(before_complete_cat) / mean(after_complete_cat)
+  percent_red_cat <- ((mean(before_complete_cat) - mean(after_complete_cat)) / 
+                      mean(before_complete_cat)) * 100
+  cat("\n  Fold reduction:", round(fold_change_cat, 2), "×\n")
+  cat("  Percent reduction:", round(percent_red_cat, 1), "%\n")
+} else {
+  cat("Insufficient complete pairs for CAT statistical testing.\n")
+}
+
+cat("\n")
+```
+
+# Summary Report
+
+```{r summary table}
+cat("\n========================================\n")
+cat("FINAL SUMMARY\n")
+cat("========================================\n\n")
+
+# Create comprehensive summary table
+final_summary <- summary_stats %>%
+  group_by(Sample_Type, Treatment) %>%
+  summarise(
+    n_bio_reps = n(),
+    n_detected = sum(!All_Non_Detect),
+    n_complete_ND = sum(All_Non_Detect, na.rm = TRUE),
+    Mean_Ct = mean(Mean_Ct, na.rm = TRUE),
+    Mean_Conc = mean(Mean_Conc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+print(final_summary)
+
+cat("\nAll plots saved as PNG files in working directory.\n\n")
+cat("Key features of this analysis:\n")
+cat("1. Combined panel plots showing Ct + Concentration together\n")
+cat("2. Consistent color schemes matching Campylobacter analysis\n")
+cat("3. Appropriate statistical tests for each sample type\n")
+cat("4. Lines connecting means for each biological replicate\n")
+cat("5. Clear marking of non-detects with × symbols\n")
+cat("6. Italicized organism names in titles\n\n")
+
+sessionInfo()
+```
+
+# Export Results
+
+```{r export-results}
+# Prepare summary results table
+summary_results <- tibble(
+  Sample_Type = character(),
+  N_Pairs = numeric(),
+  Test_Type = character(),
+  Mean_Before = numeric(),
+  Mean_After = numeric(),
+  P_Value = character()
+)
+
+# Add results if available
+if (exists("n_complete") && n_complete >= 2) {
+  summary_results <- add_row(summary_results,
+    Sample_Type = "Non-Enriched",
+    N_Pairs = n_complete,
+    Test_Type = "Paired t-test",
+    Mean_Before = round(mean(before_complete), 4),
+    Mean_After = round(mean(after_complete), 4),
+    P_Value = format.pval(t_result$p.value, digits = 4)
+  )
+}
+
+if (exists("n_complete_rvs") && n_complete_rvs >= 2) {
+  summary_results <- add_row(summary_results,
+    Sample_Type = "RVS",
+    N_Pairs = n_complete_rvs,
+    Test_Type = ifelse(all(after_complete_rvs == 0), "Wilcoxon", "Paired t-test"),
+    Mean_Before = round(mean(before_complete_rvs), 4),
+    Mean_After = round(mean(after_complete_rvs), 6),
+    P_Value = format.pval(test_rvs$p.value, digits = 4)
+  )
+}
+
+if (exists("n_complete_cat") && n_complete_cat >= 2) {
+  summary_results <- add_row(summary_results,
+    Sample_Type = "CAT",
+    N_Pairs = n_complete_cat,
+    Test_Type = "Paired t-test",
+    Mean_Before = round(mean(before_complete_cat), 4),
+    Mean_After = round(mean(after_complete_cat), 4),
+    P_Value = format.pval(test_cat$p.value, digits = 4)
+  )
+}
+
+# Export to Excel
+if (nrow(summary_results) > 0) {
+  excel_data <- list(
+    "Summary" = summary_results,
+    "All_Summary_Stats" = summary_stats,
+    "Raw_Data" = data_clean
+  )
+  
+  write_xlsx(excel_data, "Salmonella_qPCR_Results.xlsx")
+  cat("\n✓ Excel file generated: 'Salmonella_qPCR_Results.xlsx'\n\n")
+}
+
+# Print summary table
+if (nrow(summary_results) > 0) {
+  knitr::kable(summary_results,
+               col.names = c("Sample Type", "N Pairs", "Test", "Before (ng/μL)", 
+                            "After (ng/μL)", "p-value"),
+               caption = "Statistical Summary: Host-DNA Depletion Across All Sample Types")
+}
+```

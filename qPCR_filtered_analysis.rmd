@@ -1,0 +1,517 @@
+---
+title: "qPCR Filtered Samples Host-DNA Depletion Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 10
+)
+```
+
+```{r load libraries}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(readxl)
+library(patchwork)
+library(writexl)
+```
+
+# Overview
+
+This analysis examines host-DNA depletion efficacy across filtered samples for three organisms:
+- **Chicken** DNA (host DNA being depleted)
+- **Campylobacter** DNA (target pathogen)
+- **Salmonella** DNA (target pathogen)
+
+Two filtration methods were tested:
+- **Cent + Filt**: Centrifugation followed by filtration
+- **Filt**: Filtration only
+
+---
+
+# Chicken DNA Analysis
+
+## Import and Clean Data
+
+```{r chicken-data}
+# Set detection limits
+detection_limit_ct <- 40
+detection_limit_conc <- 0.00001
+
+# Read chicken data
+chicken_raw <- read_excel('/Volumes/Alice/1_METHOD_DEVELOPMENT/Host-DNA_depletion/Filtered_samples_qPCR/qPCR_filtered-host-dep_Chicken.xlsx')
+
+# Clean data
+chicken_clean <- chicken_raw %>%
+  filter(!is.na(Name), !str_detect(Name, "Blank")) %>%
+  mutate(
+    # Extract treatment
+    Treatment = if_else(str_detect(Name, "No Host"), "Before Depletion", "After Depletion"),
+    Treatment = factor(Treatment, levels = c("Before Depletion", "After Depletion")),
+    # Extract sample type
+    Sample_Type = case_when(
+      str_detect(Name, "Cent \\+ Filt") ~ "Centrifuge + Filter",
+      str_detect(Name, "^Filt") ~ "Filter Only",
+      TRUE ~ "Unknown"
+    ),
+    # Extract replicate ID
+    Replicate_ID = as.numeric(str_extract(Name, "\\d+")),
+    # Non-detects
+    Below_Detection = is.na(Ct) | is.na(`Calc Conc (ng/ul)`),
+    # For plotting
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(`Calc Conc (ng/ul)`), detection_limit_conc, `Calc Conc (ng/ul)`)
+  ) %>%
+  select(Name, Treatment, Sample_Type, Replicate_ID, Ct, Ct_plot, 
+         Concentration = `Calc Conc (ng/ul)`, Conc_plot, Below_Detection)
+
+# Summary statistics
+chicken_summary <- chicken_clean %>%
+  group_by(Sample_Type, Treatment, Replicate_ID) %>%
+  summarise(
+    n_measurements = n(),
+    n_detected = sum(!Below_Detection),
+    n_non_detect = sum(Below_Detection),
+    All_Non_Detect = all(Below_Detection),
+    Mean_Ct = ifelse(all(is.na(Ct)), NA_real_, mean(Ct, na.rm = TRUE)),
+    SE_Ct = ifelse(all(is.na(Ct)), NA_real_, sd(Ct, na.rm = TRUE) / sqrt(sum(!is.na(Ct)))),
+    Mean_Conc = ifelse(all(is.na(Concentration)), NA_real_, mean(Concentration, na.rm = TRUE)),
+    SE_Conc = ifelse(all(is.na(Concentration)), NA_real_, sd(Concentration, na.rm = TRUE) / sqrt(sum(!is.na(Concentration)))),
+    .groups = "drop"
+  )
+
+chicken_summary %>%
+  select(Sample_Type, Treatment, Replicate_ID, n_detected, n_non_detect, Mean_Ct, Mean_Conc) %>%
+  knitr::kable(digits = 4, caption = "Chicken DNA: Summary by Sample Type and Replicate")
+```
+
+## Combined Panel Plot
+
+```{r chicken-plot}
+# Create long format
+chicken_long <- chicken_clean %>%
+  select(Sample_Type, Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL)"))
+  )
+
+# Color palette
+color_palette_chicken <- c("1" = "#88D498", "2" = "#A846A0", "3" = "#98C1D9")
+
+# Create plot
+chicken_panel <- ggplot(chicken_long,
+                        aes(x = Treatment, y = Value,
+                            color = as.factor(Replicate_ID),
+                            group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 3.5, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(aes(shape = Below_Detection), alpha = 0.5, 
+              width = 0.15, height = 0, size = 2) +
+  facet_grid(Measurement ~ Sample_Type, scales = "free_y", switch = "y") +
+  scale_color_manual(values = color_palette_chicken,
+                     name = "Biological\nReplicate") +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 4),
+                     labels = c("Detected", "Non-detect"),
+                     name = "Detection\nStatus") +
+  labs(
+    title = "Filtered Samples: Chicken Host-DNA Depletion Efficacy",
+    subtitle = "Each point = qPCR technical replicate | × = Non-detect | Lines connect mean ± SE",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "right"
+  )
+
+print(chicken_panel)
+ggsave("chicken_filtered_combined_panels.png", chicken_panel,
+       width = 12, height = 10, dpi = 600)
+```
+
+## Statistical Analysis
+
+```{r chicken-stats}
+cat("\n========================================\n")
+cat("CHICKEN DNA - STATISTICAL ANALYSIS\n")
+cat("========================================\n\n")
+
+# Function to analyze each sample type
+analyze_filtered <- function(data, sample_type_name) {
+  cat("\n--- ", sample_type_name, " ---\n\n", sep = "")
+  
+  paired_data <- data %>%
+    filter(Sample_Type == sample_type_name) %>%
+    select(Replicate_ID, Treatment, Mean_Ct, Mean_Conc, All_Non_Detect) %>%
+    pivot_wider(names_from = Treatment,
+                values_from = c(Mean_Ct, Mean_Conc, All_Non_Detect))
+  
+  before_conc <- paired_data$`Mean_Conc_Before Depletion`
+  after_conc <- paired_data$`Mean_Conc_After Depletion`
+  
+  complete_pairs <- !is.na(before_conc) & !is.na(after_conc)
+  n_complete <- sum(complete_pairs)
+  
+  if (n_complete >= 2) {
+    before_complete <- before_conc[complete_pairs]
+    after_complete <- after_conc[complete_pairs]
+    
+    # Choose test
+    if (all(after_complete == 0) || all(after_complete < 0.0001)) {
+      test_result <- wilcox.test(before_complete, after_complete,
+                                 paired = TRUE, alternative = "greater")
+      test_type <- "Wilcoxon signed-rank"
+    } else {
+      test_result <- t.test(before_complete, after_complete,
+                           paired = TRUE, alternative = "greater")
+      test_type <- "Paired t-test"
+    }
+    
+    cat("  Test:", test_type, "\n")
+    cat("  n pairs:", n_complete, "\n")
+    cat("  Mean Before:", round(mean(before_complete), 4), "ng/μL\n")
+    cat("  Mean After:", round(mean(after_complete), 6), "ng/μL\n")
+    cat("  p-value:", format.pval(test_result$p.value, digits = 4), "\n")
+    
+    if (test_result$p.value < 0.001) {
+      cat("  *** HIGHLY SIGNIFICANT ***\n")
+    } else if (test_result$p.value < 0.01) {
+      cat("  ** VERY SIGNIFICANT **\n")
+    } else if (test_result$p.value < 0.05) {
+      cat("  * SIGNIFICANT *\n")
+    } else {
+      cat("  Not significant\n")
+    }
+    
+    # Effect size
+    if (mean(after_complete) == 0 || mean(after_complete) < 0.0001) {
+      cat("\n  Fold reduction: Complete (>10,000×)\n")
+      cat("  Percent reduction: ~100%\n\n")
+    } else {
+      fold_change <- mean(before_complete) / mean(after_complete)
+      percent_red <- ((mean(before_complete) - mean(after_complete)) / 
+                      mean(before_complete)) * 100
+      cat("\n  Fold reduction:", round(fold_change, 2), "×\n")
+      cat("  Percent reduction:", round(percent_red, 1), "%\n\n")
+    }
+  } else {
+    cat("  Insufficient pairs for testing\n\n")
+  }
+}
+
+# Analyze both sample types
+analyze_filtered(chicken_summary, "Centrifuge + Filter")
+analyze_filtered(chicken_summary, "Filter Only")
+```
+
+---
+
+# Campylobacter DNA Analysis
+
+## Import and Clean Data
+
+```{r campy-data}
+# Read Campylobacter data
+campy_raw <- read_excel('/Volumes/Alice/1_METHOD_DEVELOPMENT/Host-DNA_depletion/Filtered_samples_qPCR/qPCR_Filtered_Campylobacter.xlsx')
+
+# Clean data
+campy_clean <- campy_raw %>%
+  filter(!is.na(Name), !str_detect(Name, "Blank")) %>%
+  mutate(
+    Treatment = if_else(str_detect(Name, "No Host"), "Before Depletion", "After Depletion"),
+    Treatment = factor(Treatment, levels = c("Before Depletion", "After Depletion")),
+    Sample_Type = case_when(
+      str_detect(Name, "Cent \\+ Filt") ~ "Centrifuge + Filter",
+      str_detect(Name, "^Filt") ~ "Filter Only",
+      TRUE ~ "Unknown"
+    ),
+    Replicate_ID = as.numeric(str_extract(Name, "\\d+")),
+    Below_Detection = is.na(Ct) | is.na(`Calc Conc (ng/ul)`),
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(`Calc Conc (ng/ul)`), detection_limit_conc, `Calc Conc (ng/ul)`)
+  ) %>%
+  select(Name, Treatment, Sample_Type, Replicate_ID, Ct, Ct_plot, 
+         Concentration = `Calc Conc (ng/ul)`, Conc_plot, Below_Detection)
+
+# Summary statistics
+campy_summary <- campy_clean %>%
+  group_by(Sample_Type, Treatment, Replicate_ID) %>%
+  summarise(
+    n_measurements = n(),
+    n_detected = sum(!Below_Detection),
+    n_non_detect = sum(Below_Detection),
+    All_Non_Detect = all(Below_Detection),
+    Mean_Ct = ifelse(all(is.na(Ct)), NA_real_, mean(Ct, na.rm = TRUE)),
+    SE_Ct = ifelse(all(is.na(Ct)), NA_real_, sd(Ct, na.rm = TRUE) / sqrt(sum(!is.na(Ct)))),
+    Mean_Conc = ifelse(all(is.na(Concentration)), NA_real_, mean(Concentration, na.rm = TRUE)),
+    SE_Conc = ifelse(all(is.na(Concentration)), NA_real_, sd(Concentration, na.rm = TRUE) / sqrt(sum(!is.na(Concentration)))),
+    .groups = "drop"
+  )
+
+campy_summary %>%
+  select(Sample_Type, Treatment, Replicate_ID, n_detected, n_non_detect, Mean_Ct, Mean_Conc) %>%
+  knitr::kable(digits = 4, caption = "Campylobacter DNA: Summary by Sample Type and Replicate")
+
+campy_clean
+```
+
+## Combined Panel Plot
+
+```{r campy-plot}
+# Create long format
+campy_long <- campy_clean %>%
+  select(Sample_Type, Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL)"))
+  )
+
+# Color palette
+color_palette_campy <- c("1" = "#88D498", "2" = "#A846A0", "3" = "#98C1D9")
+
+# Create plot
+campy_panel <- ggplot(campy_long,
+                      aes(x = Treatment, y = Value,
+                          color = as.factor(Replicate_ID),
+                          group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 3.5, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(aes(shape = Below_Detection), alpha = 0.5, 
+              width = 0.15, height = 0, size = 2) +
+  facet_grid(Measurement ~ Sample_Type, scales = "free_y", switch = "y") +
+  scale_color_manual(values = color_palette_campy,
+                     name = "Biological\nReplicate") +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 4),
+                     labels = c("Detected", "Non-detect"),
+                     name = "Detection\nStatus") +
+  labs(
+    title = expression(paste("Filtered Samples: Host-DNA Depletion Effect on ", italic("Campylobacter"))),
+    subtitle = "Each point = qPCR technical replicate | × = Non-detect | Lines connect mean ± SE",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "right"
+  )
+
+print(campy_panel)
+ggsave("campylobacter_filtered_combined_panels.png", campy_panel,
+       width = 12, height = 10, dpi = 600)
+```
+
+## Statistical Analysis
+
+```{r campy-stats}
+cat("\n========================================\n")
+cat("CAMPYLOBACTER DNA - STATISTICAL ANALYSIS\n")
+cat("========================================\n\n")
+
+analyze_filtered(campy_summary, "Centrifuge + Filter")
+analyze_filtered(campy_summary, "Filter Only")
+```
+
+---
+
+# Salmonella DNA Analysis
+
+## Import and Clean Data
+
+```{r salm-data}
+# Read Salmonella data
+salm_raw <- read_excel('/Volumes/Alice/1_METHOD_DEVELOPMENT/Host-DNA_depletion/Filtered_samples_qPCR/qPCR_filtered-host-dep_Salmonella.xlsx')
+
+# Clean data
+salm_clean <- salm_raw %>%
+  filter(!is.na(Name), !str_detect(Name, "Blank")) %>%
+  mutate(
+    Treatment = if_else(str_detect(Name, "No Host"), "Before Depletion", "After Depletion"),
+    Treatment = factor(Treatment, levels = c("Before Depletion", "After Depletion")),
+    Sample_Type = case_when(
+      str_detect(Name, "Cent \\+ Filt") ~ "Centrifuge + Filter",
+      str_detect(Name, "^Filt") ~ "Filter Only",
+      TRUE ~ "Unknown"
+    ),
+    Replicate_ID = as.numeric(str_extract(Name, "\\d+")),
+    Below_Detection = is.na(Ct) | is.na(`Calc Conc (ng/ul)`),
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(`Calc Conc (ng/ul)`), detection_limit_conc, `Calc Conc (ng/ul)`)
+  ) %>%
+  select(Name, Treatment, Sample_Type, Replicate_ID, Ct, Ct_plot, 
+         Concentration = `Calc Conc (ng/ul)`, Conc_plot, Below_Detection)
+
+# Summary statistics
+salm_summary <- salm_clean %>%
+  group_by(Sample_Type, Treatment, Replicate_ID) %>%
+  summarise(
+    n_measurements = n(),
+    n_detected = sum(!Below_Detection),
+    n_non_detect = sum(Below_Detection),
+    All_Non_Detect = all(Below_Detection),
+    Mean_Ct = ifelse(all(is.na(Ct)), NA_real_, mean(Ct, na.rm = TRUE)),
+    SE_Ct = ifelse(all(is.na(Ct)), NA_real_, sd(Ct, na.rm = TRUE) / sqrt(sum(!is.na(Ct)))),
+    Mean_Conc = ifelse(all(is.na(Concentration)), NA_real_, mean(Concentration, na.rm = TRUE)),
+    SE_Conc = ifelse(all(is.na(Concentration)), NA_real_, sd(Concentration, na.rm = TRUE) / sqrt(sum(!is.na(Concentration)))),
+    .groups = "drop"
+  )
+
+salm_summary %>%
+  select(Sample_Type, Treatment, Replicate_ID, n_detected, n_non_detect, Mean_Ct, Mean_Conc) %>%
+  knitr::kable(digits = 4, caption = "Salmonella DNA: Summary by Sample Type and Replicate")
+```
+
+## Combined Panel Plot
+
+```{r salm-plot}
+# Create long format
+salm_long <- salm_clean %>%
+  select(Sample_Type, Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL)"))
+  )
+
+salm_long
+
+# Color palette
+color_palette_salm <- c("1" = "#88D498", "2" = "#A846A0", "3" = "#98C1D9")
+
+# Create plot
+salm_panel <- ggplot(salm_long,
+                     aes(x = Treatment, y = Value,
+                         color = as.factor(Replicate_ID),
+                         group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 3.5, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(aes(shape = Below_Detection), alpha = 0.5, 
+              width = 0.15, height = 0, size = 2) +
+  facet_grid(Measurement ~ Sample_Type, scales = "free_y", switch = "y") +
+  scale_color_manual(values = color_palette_salm,
+                     name = "Biological\nReplicate") +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 4),
+                     labels = c("Detected", "Non-detect"),
+                     name = "Detection\nStatus") +
+  labs(
+    title = expression(paste("Filtered Samples: Host-DNA Depletion Effect on ", italic("Salmonella"))),
+    subtitle = "Each point = qPCR technical replicate | × = Non-detect | Lines connect mean ± SE",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "right"
+  )
+
+print(salm_panel)
+ggsave("salmonella_filtered_combined_panels.png", salm_panel,
+       width = 12, height = 10, dpi = 600)
+```
+
+## Statistical Analysis
+
+```{r salm-stats}
+cat("\n========================================\n")
+cat("SALMONELLA DNA - STATISTICAL ANALYSIS\n")
+cat("========================================\n\n")
+
+analyze_filtered(salm_summary, "Centrifuge + Filter")
+analyze_filtered(salm_summary, "Filter Only")
+```
+
+---
+
+# Summary
+
+```{r summary}
+cat("\n========================================\n")
+cat("FINAL SUMMARY\n")
+cat("========================================\n\n")
+
+cat("Three high-resolution plots generated:\n")
+cat("1. chicken_filtered_combined_panels.png\n")
+cat("2. campylobacter_filtered_combined_panels.png\n")
+cat("3. salmonella_filtered_combined_panels.png\n\n")
+
+cat("Key findings:\n")
+cat("- Chicken DNA (host): Expected to be REDUCED after depletion\n")
+cat("- Campylobacter DNA (pathogen): Expected to be RETAINED/INCREASED\n")
+cat("- Salmonella DNA (pathogen): Expected to be RETAINED/INCREASED\n\n")
+
+cat("Statistical tests automatically selected:\n")
+cat("- Wilcoxon test when after values near zero\n")
+cat("- Paired t-test otherwise\n\n")
+
+sessionInfo()
+```

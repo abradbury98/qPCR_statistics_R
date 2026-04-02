@@ -1,0 +1,624 @@
+---
+title: "qPCR Host-DNA Depletion Analysis - IMPROVED"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+```
+
+```{r load libraries}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(readxl)
+library(patchwork)  # For combining plots
+```
+
+# Import and organize data
+
+```{r load data}
+# Read the data
+data <- read_excel('qPCR_host_depletion_chicken_all.xlsx')
+
+# View structure
+glimpse(data)
+```
+
+```{r clean data}
+# Clean and structure the data
+data_clean <- data %>%
+  # Remove rows with all NA values
+  filter(!is.na(Name)) %>%
+  # Re-label "No Host-DNA Depletion No. 3" and "Host-DNA Depletion No. 3"
+  # as cheesecloth replicate 4
+  mutate(
+    Name = case_when(
+      Name == "No Host-DNA Depletion No. 3" ~ "Cheesecloth No Host 4",
+      Name == "Host-DNA Depletion No. 3"    ~ "Cheesecloth Host-DNA Depletion 4",
+      TRUE                                  ~ Name
+    )
+  ) %>%
+  # Extract sample information
+  mutate(
+    Treatment = case_when(
+      str_detect(Name, "No Host") ~ "Before Depletion",
+      str_detect(Name, "Host-DNA Depletion|\\bHost\\b") ~ "After Depletion",
+      TRUE ~ "Unknown"
+    ),
+    Treatment = factor(Treatment, levels = c("Before Depletion", "After Depletion")),
+    Sample_Type = case_when(
+      str_detect(Name, "cheesecloth|Cheesecloth") ~ "Cheesecloth",
+      str_detect(Name, "RVS") ~ "RVS",
+      str_detect(Name, "CAT") ~ "CAT",
+      str_detect(Name, "Cent \\+ Filt") ~ "Centrifuge + Filter",
+      str_detect(Name, "Filt") & !str_detect(Name, "Cent") ~ "Filter Only",
+      TRUE ~ "Unknown"
+    ),
+    Replicate_ID = str_extract(Name, "\\d+$"),
+    Replicate_ID = as.numeric(Replicate_ID)
+  ) %>%
+  select(Name, Treatment, Sample_Type, Replicate_ID, Ct, `Calc Conc (ng/ul)`) %>%
+  rename(Concentration = `Calc Conc (ng/ul)`)
+
+# View cleaned data summary
+data_clean %>% 
+  group_by(Sample_Type, Treatment) %>% 
+  summarise(
+    Total_Measurements = n(),
+    Detected = sum(!is.na(Concentration)),
+    Non_Detects = sum(is.na(Concentration)),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Data Overview by Sample Type and Treatment")
+```
+
+```{r prepare summary stats}
+# Set detection limits
+detection_limit_ct <- 40       # Standard qPCR detection limit
+detection_limit_conc <- 0.0001 # Very low concentration (0.1 pg/μL)
+
+# Calculate summary statistics by biological replicate
+# For non-detects, we'll handle them separately in statistical tests
+summary_stats <- data_clean %>%
+  mutate(
+    Below_Detection = is.na(Ct),
+    # Flag samples where ALL technical replicates are non-detects
+    Sample_ID = paste(Sample_Type, Treatment, Replicate_ID, sep = "_")
+  ) %>%
+  group_by(Sample_Type, Treatment, Replicate_ID) %>%
+  summarise(
+    n_measurements = n(),
+    n_detected = sum(!Below_Detection),
+    n_non_detect = sum(Below_Detection),
+    All_Non_Detect = all(Below_Detection),
+    Mean_Ct = ifelse(all(is.na(Ct)), NA_real_, mean(Ct, na.rm = TRUE)),
+    SD_Ct = ifelse(all(is.na(Ct)), NA_real_, sd(Ct, na.rm = TRUE)),
+    SE_Ct = ifelse(all(is.na(Ct)), NA_real_, SD_Ct / sqrt(sum(!is.na(Ct)))),
+    Mean_Conc = ifelse(all(is.na(Concentration)), NA_real_, mean(Concentration, na.rm = TRUE)),
+    SD_Conc = ifelse(all(is.na(Concentration)), NA_real_, sd(Concentration, na.rm = TRUE)),
+    SE_Conc = ifelse(all(is.na(Concentration)), NA_real_, SD_Conc / sqrt(sum(!is.na(Concentration)))),
+    .groups = "drop"
+  )
+
+# Display summary table
+summary_stats %>%
+  select(Sample_Type, Treatment, Replicate_ID, n_detected, n_non_detect, 
+         All_Non_Detect, Mean_Ct, Mean_Conc) %>%
+  arrange(Sample_Type, Replicate_ID, Treatment) %>%
+  knitr::kable(digits = 2, caption = "Summary Statistics by Biological Replicate")
+```
+
+# Cheesecloth Samples - COMBINED PANEL PLOT
+
+```{r cheesecloth combined panel plot}
+# Prepare cheesecloth data for plotting
+cheese_data <- data_clean %>%
+  filter(Sample_Type == "Cheesecloth") %>%
+  mutate(
+    Below_Detection = is.na(Ct),
+    # For plotting, assign detection limit values to non-detects
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(Concentration), detection_limit_conc, Concentration)
+  )
+
+# Define color palette (matching your previous plots)
+color_palette <- c("1" = "#fc8d62", "2" = "#4DBBD5", 
+                   "3" = "#66c2a5", "4" = "#e78ac3")
+
+# Create long format data for faceting
+cheese_long <- cheese_data %>%
+  select(Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL) - log10 scale"))
+  )
+
+# Create the combined panel plot
+cheese_panel_plot <- ggplot(cheese_long,
+                            aes(x = Treatment, y = Value,
+                                color = as.factor(Replicate_ID),
+                                group = as.factor(Replicate_ID))) +
+  # Mean values as lines connecting before/after
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  # Mean values as points
+  stat_summary(fun = mean, geom = "point", size = 4, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  # Error bars (SE)
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  # Individual technical replicates (with shape for non-detects)
+  geom_jitter(aes(shape = Below_Detection), alpha = 0.5, 
+              width = 0.15, height = 0, size = 2.5) +
+  # Facet by measurement type
+  facet_wrap(~ Measurement, ncol = 1, scales = "free_y", strip.position = "left") +
+  # Use log scale for concentration panel only
+  scale_y_log10() +
+  scale_color_manual(values = color_palette,
+                     name = "Biological\nReplicate") +
+  scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 4),
+                     labels = c("Detected", "Non-detect"),
+                     name = "Detection\nStatus") +
+  labs(
+    title = "Cheesecloth Filtered Samples: Host-DNA Depletion Efficacy",
+    subtitle = "Each point = qPCR technical replicate | Lines connect mean ± SE | Concentration on log scale",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "right"
+  )
+
+print(cheese_panel_plot)
+
+ggsave("cheesecloth_combined_panels.png", cheese_panel_plot,
+       width = 10, height = 10, dpi = 600)
+```
+
+# Statistical Analysis with Non-Detection Handling
+
+```{r stats with non-detections}
+cat("\n========================================\n")
+cat("STATISTICAL ANALYSIS - CHEESECLOTH\n")
+cat("========================================\n\n")
+
+# Prepare paired data
+cheese_paired <- summary_stats %>%
+  filter(Sample_Type == "Cheesecloth") %>%
+  select(Replicate_ID, Treatment, Mean_Ct, Mean_Conc, All_Non_Detect) %>%
+  pivot_wider(names_from = Treatment, 
+              values_from = c(Mean_Ct, Mean_Conc, All_Non_Detect))
+
+cat("Paired Data Structure:\n")
+print(cheese_paired)
+cat("\n")
+
+# Extract before/after vectors
+before_conc <- cheese_paired$`Mean_Conc_Before Depletion`
+after_conc <- cheese_paired$`Mean_Conc_After Depletion`
+before_ct <- cheese_paired$`Mean_Ct_Before Depletion`
+after_ct <- cheese_paired$`Mean_Ct_After Depletion`
+
+# Identify which samples have non-detects
+after_nondetect <- cheese_paired$`All_Non_Detect_After Depletion`
+
+cat("Non-detection status:\n")
+for (i in 1:nrow(cheese_paired)) {
+  cat(sprintf("Replicate %d: Before = %s, After = %s\n",
+              cheese_paired$Replicate_ID[i],
+              ifelse(is.na(before_conc[i]), "ND", "detected"),
+              ifelse(is.na(after_conc[i]), "ND", "detected")))
+}
+cat("\n")
+
+# ============================================================================
+# APPROACH 1: EXCLUDE NON-DETECTS (Conservative)
+# ============================================================================
+cat("========================================\n")
+cat("APPROACH 1: Excluding Non-Detects\n")
+cat("========================================\n\n")
+
+# Filter to only complete pairs
+complete_pairs <- !is.na(before_conc) & !is.na(after_conc)
+n_complete <- sum(complete_pairs)
+
+cat("Complete pairs (both detected):", n_complete, "\n\n")
+
+if (n_complete >= 2) {
+  before_complete <- before_conc[complete_pairs]
+  after_complete <- after_conc[complete_pairs]
+  
+  # Paired t-test
+  t_result <- t.test(before_complete, after_complete,
+                     paired = TRUE, alternative = "greater")
+  
+  cat("PAIRED T-TEST (excluding non-detects):\n")
+  cat("  n pairs:", n_complete, "\n")
+  cat("  Mean Before:", round(mean(before_complete), 3), "ng/μL\n")
+  cat("  Mean After:", round(mean(after_complete), 3), "ng/μL\n")
+  cat("  t-statistic:", round(t_result$statistic, 3), "\n")
+  cat("  df:", t_result$parameter, "\n")
+  cat("  p-value:", format.pval(t_result$p.value, digits = 4), "\n")
+  
+  if (t_result$p.value < 0.05) {
+    cat("  *** SIGNIFICANT (p < 0.05) ***\n")
+  } else if (t_result$p.value < 0.10) {
+    cat("  † Trend toward significance (p < 0.10)\n")
+  } else {
+    cat("  Not significant (p ≥ 0.10)\n")
+  }
+  
+  # Effect size
+  differences <- before_complete - after_complete
+  cohens_d <- mean(differences) / sd(differences)
+  fold_change <- mean(before_complete) / mean(after_complete)
+  
+  cat("\nEFFECT SIZE:\n")
+  cat("  Fold reduction:", round(fold_change, 2), "×\n")
+  cat("  Cohen's d:", round(cohens_d, 2), "\n\n")
+  
+  # Wilcoxon test
+  w_result <- wilcox.test(before_complete, after_complete,
+                          paired = TRUE, alternative = "greater")
+  cat("WILCOXON SIGNED-RANK TEST:\n")
+  cat("  V-statistic:", w_result$statistic, "\n")
+  cat("  p-value:", format.pval(w_result$p.value, digits = 4), "\n\n")
+} else {
+  cat("Insufficient complete pairs for statistical testing.\n\n")
+}
+
+# ============================================================================
+# APPROACH 2: SUBSTITUTE NON-DETECTS WITH DETECTION LIMIT
+# ============================================================================
+cat("========================================\n")
+cat("APPROACH 2: Substituting Non-Detects with Detection Limit\n")
+cat("========================================\n\n")
+
+# Substitute NA with detection limit
+before_subst <- ifelse(is.na(before_conc), detection_limit_conc, before_conc)
+after_subst <- ifelse(is.na(after_conc), detection_limit_conc, after_conc)
+
+cat("This provides a CONSERVATIVE (minimum) estimate of depletion.\n")
+cat("Non-detects are assumed to be at the detection limit.\n\n")
+
+t_result_subst <- t.test(before_subst, after_subst,
+                         paired = TRUE, alternative = "greater")
+
+cat("PAIRED T-TEST (with substitution):\n")
+cat("  n pairs:", length(before_subst), "\n")
+cat("  Mean Before:", round(mean(before_subst), 3), "ng/μL\n")
+cat("  Mean After:", round(mean(after_subst), 3), "ng/μL\n")
+cat("  t-statistic:", round(t_result_subst$statistic, 3), "\n")
+cat("  df:", t_result_subst$parameter, "\n")
+cat("  p-value:", format.pval(t_result_subst$p.value, digits = 4), "\n")
+
+if (t_result_subst$p.value < 0.05) {
+  cat("  *** SIGNIFICANT even with conservative substitution ***\n")
+} else {
+  cat("  Not significant with conservative substitution\n")
+}
+
+differences_subst <- before_subst - after_subst
+cohens_d_subst <- mean(differences_subst) / sd(differences_subst)
+fold_change_subst <- mean(before_subst) / mean(after_subst)
+
+cat("\nEFFECT SIZE (with substitution):\n")
+cat("  Fold reduction:", round(fold_change_subst, 2), "×\n")
+cat("  Cohen's d:", round(cohens_d_subst, 2), "\n\n")
+
+# ============================================================================
+# APPROACH 3: SIGN TEST (Most appropriate for non-detects!)
+# ============================================================================
+cat("========================================\n")
+cat("APPROACH 3: Sign Test (Recommended for Non-Detects)\n")
+cat("========================================\n\n")
+
+cat("The Sign Test only considers DIRECTION of change, not magnitude.\n")
+cat("This is ideal when you have non-detects (complete depletion)!\n\n")
+
+# Determine direction of change for each pair
+# If after is ND and before is detected, that's a reduction
+# If after is detected and before is ND, that's an increase (shouldn't happen)
+# If both are ND, exclude from sign test
+
+changes <- rep(NA, length(before_conc))
+for (i in 1:length(before_conc)) {
+  if (!is.na(before_conc[i]) && !is.na(after_conc[i])) {
+    # Both detected - compare values
+    changes[i] <- ifelse(before_conc[i] > after_conc[i], "reduction", "increase")
+  } else if (!is.na(before_conc[i]) && is.na(after_conc[i])) {
+    # Before detected, after ND - clear reduction
+    changes[i] <- "reduction"
+  } else if (is.na(before_conc[i]) && !is.na(after_conc[i])) {
+    # Before ND, after detected - increase (unexpected)
+    changes[i] <- "increase"
+  }
+  # If both ND, leave as NA
+}
+
+cat("Direction of change for each replicate:\n")
+for (i in 1:length(changes)) {
+  if (!is.na(changes[i])) {
+    cat(sprintf("  Replicate %d: %s\n", cheese_paired$Replicate_ID[i], changes[i]))
+  }
+}
+cat("\n")
+
+# Count reductions vs increases
+n_reductions <- sum(changes == "reduction", na.rm = TRUE)
+n_increases <- sum(changes == "increase", na.rm = TRUE)
+n_total <- n_reductions + n_increases
+
+cat("SIGN TEST RESULTS:\n")
+cat("  Total pairs with change:", n_total, "\n")
+cat("  Reductions:", n_reductions, "\n")
+cat("  Increases:", n_increases, "\n")
+
+# Binomial test (H0: probability of reduction = 0.5)
+if (n_total > 0) {
+  sign_test <- binom.test(n_reductions, n_total, p = 0.5, alternative = "greater")
+  cat("  p-value:", format.pval(sign_test$p.value, digits = 4), "\n")
+  
+  if (sign_test$p.value < 0.05) {
+    cat("  *** SIGNIFICANT: Consistent direction of reduction (p < 0.05) ***\n")
+  } else if (sign_test$p.value < 0.10) {
+    cat("  † Trend toward consistent reduction (p < 0.10)\n")
+  } else {
+    cat("  Not significant\n")
+  }
+  
+  cat("\nINTERPRETATION:\n")
+  if (n_reductions == n_total) {
+    cat("  ALL samples showed reduction in chicken DNA.\n")
+    cat("  This includes samples with complete depletion (non-detect).\n")
+  } else {
+    cat(sprintf("  %d out of %d samples showed reduction.\n", n_reductions, n_total))
+  }
+} else {
+  cat("  No pairs available for sign test.\n")
+}
+
+cat("\n")
+
+# ============================================================================
+# SUMMARY AND RECOMMENDATION
+# ============================================================================
+cat("========================================\n")
+cat("SUMMARY AND RECOMMENDATION\n")
+cat("========================================\n\n")
+
+cat("For publication, we recommend reporting:\n\n")
+cat("1. PRIMARY ANALYSIS: Approach 1 (excluding non-detects)\n")
+cat("   - Most conservative and standard approach\n")
+cat("   - Report mean values and statistical test results\n\n")
+
+cat("2. QUALITATIVE OBSERVATION:\n")
+cat("   - Note in text: 'X samples showed no detectable chicken DNA\n")
+cat("     after depletion (Ct > 40), indicating complete or near-complete\n")
+cat("     depletion.'\n\n")
+
+cat("3. SUPPLEMENTARY: Sign Test (Approach 3)\n")
+cat("   - Shows consistent DIRECTION of effect across all samples\n")
+cat("   - Particularly powerful when you have complete depletions\n\n")
+
+cat("AVOID: Simply substituting detection limit values (Approach 2)\n")
+cat("       unless you have a strong scientific justification.\n\n")
+```
+
+# Filtered Samples
+
+```{r filtered combined panel plot}
+# Check what samples we have in filtered category
+cat("Checking filtered samples in data:\n")
+data_clean %>% 
+  filter(Sample_Type %in% c("Centrifuge + Filter", "Filter Only")) %>%
+  count(Sample_Type, Treatment, Replicate_ID) %>%
+  print()
+
+# Prepare filtered data for plotting
+filtered_data <- data_clean %>%
+  filter(Sample_Type %in% c("Centrifuge + Filter", "Filter Only")) %>%
+  mutate(
+    Below_Detection = is.na(Ct),
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(Concentration), detection_limit_conc, Concentration)
+  )
+
+# Expanded color palette for more replicates
+color_palette_extended <- c("1" = "#E64B35", "2" = "#4DBBD5", 
+                            "3" = "#00A087", "4" = "#3C5488",
+                            "5" = "#F39B7F", "6" = "#8491B4")
+
+# Create long format data for faceting
+filtered_long <- filtered_data %>%
+  select(Sample_Type, Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL) - log10 scale"))
+  )
+
+# Create the combined panel plot
+filtered_panel_plot <- ggplot(filtered_long,
+                              aes(x = Treatment, y = Value,
+                                  color = as.factor(Replicate_ID),
+                                  group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 3.5, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(alpha = 0.4, width = 0.15, height = 0, size = 2) +
+  facet_grid(Measurement ~ Sample_Type, scales = "free_y", switch = "y") +
+  scale_y_log10() +
+  scale_color_manual(values = color_palette_extended,
+                     name = "Replicate") +
+  labs(
+    title = "Filtered Samples: Host-DNA Depletion Efficacy",
+    subtitle = "Each point = qPCR technical replicate | Lines connect mean ± SE | Concentration on log scale",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "right"
+  )
+
+print(filtered_panel_plot)
+ggsave("filtered_combined_panels.png", filtered_panel_plot,
+       width = 12, height = 10, dpi = 600)
+```
+
+# Enriched Samples
+
+```{r enriched combined panel plot}
+# Check what samples we have in enriched category
+cat("Checking enriched samples in data:\n")
+data_clean %>% 
+  filter(Sample_Type %in% c("RVS", "CAT")) %>%
+  count(Sample_Type, Treatment, Replicate_ID) %>%
+  print()
+
+# Prepare enriched data for plotting
+enriched_data <- data_clean %>%
+  filter(Sample_Type %in% c("RVS", "CAT")) %>%
+  mutate(
+    Below_Detection = is.na(Ct),
+    Ct_plot = ifelse(is.na(Ct), detection_limit_ct, Ct),
+    Conc_plot = ifelse(is.na(Concentration), detection_limit_conc, Concentration)
+  )
+
+# Create long format data for faceting
+enriched_long <- enriched_data %>%
+  select(Sample_Type, Treatment, Replicate_ID, Below_Detection, Ct_plot, Conc_plot) %>%
+  pivot_longer(
+    cols = c(Ct_plot, Conc_plot),
+    names_to = "Measurement",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Measurement = factor(Measurement,
+                        levels = c("Ct_plot", "Conc_plot"),
+                        labels = c("Ct Value", 
+                                  "DNA Concentration (ng/µL) - log10 scale"))
+  )
+
+# Create the combined panel plot
+enriched_panel_plot <- ggplot(enriched_long,
+                              aes(x = Treatment, y = Value,
+                                  color = as.factor(Replicate_ID),
+                                  group = as.factor(Replicate_ID))) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun = mean, geom = "point", size = 3.5, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", 
+               width = 0.2, linewidth = 0.8, na.rm = TRUE,
+               position = position_dodge(width = 0.3)) +
+  geom_jitter(alpha = 0.4, width = 0.15, height = 0, size = 2) +
+  facet_grid(Measurement ~ Sample_Type, scales = "free_y", switch = "y") +
+  scale_y_log10() +
+  scale_color_manual(values = color_palette_extended,
+                     name = "Replicate") +
+  labs(
+    title = "Enriched Samples: Host-DNA Depletion Efficacy",
+    subtitle = "Each point = qPCR technical replicate | Lines connect mean ± SE | Concentration on log scale",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold", size = 9),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "right"
+  )
+
+print(enriched_panel_plot)
+ggsave("enriched_combined_panels.png", enriched_panel_plot,
+       width = 12, height = 10, dpi = 600)
+```
+
+# Summary Report
+
+```{r summary table}
+cat("\n========================================\n")
+cat("FINAL SUMMARY\n")
+cat("========================================\n\n")
+
+# Create comprehensive summary table
+final_summary <- summary_stats %>%
+  group_by(Sample_Type, Treatment) %>%
+  summarise(
+    n_bio_reps = n(),
+    n_detected = sum(!All_Non_Detect),
+    n_complete_ND = sum(All_Non_Detect, na.rm = TRUE),
+    Mean_Ct = mean(Mean_Ct, na.rm = TRUE),
+    Mean_Conc = mean(Mean_Conc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+print(final_summary)
+
+cat("\nAll plots saved as PNG files in working directory.\n\n")
+cat("Key improvements in this analysis:\n")
+cat("1. Proper handling of non-detections in statistical tests\n")
+cat("2. Three statistical approaches presented (exclude, substitute, sign test)\n")
+cat("3. Combined panel plots showing Ct + Concentration together\n")
+cat("4. Lines connecting means for each biological replicate\n")
+cat("5. Clear marking of detection limits\n")
+cat("6. Better color scheme matching your previous plots\n\n")
+
+sessionInfo()
+```
